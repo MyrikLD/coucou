@@ -19,6 +19,8 @@ use crate::settings::Settings;
 const MAX_TOKENS: u32 = 4096;
 /// Text files are inlined into the first message up to this many characters.
 const MAX_INLINE_CHARS: usize = 24_000;
+/// Larger images are named rather than sent.
+const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 /// Streamed replies reach the island at most this often.
 const DELTA_INTERVAL: Duration = Duration::from_millis(66);
 
@@ -314,14 +316,23 @@ pub async fn send(
         return Err("Pick a model above the chat box first.".into());
     }
 
-    let user_text = match (chat.is_empty(), &context) {
+    let (user_text, image) = match (chat.is_empty(), &context) {
         (true, Some(ctx)) => with_context(ctx, &query),
-        _ => query,
+        _ => (query, None),
+    };
+    // An image rides along as an image_url part this once; the history keeps
+    // the text, which every provider reads, should the next turn go elsewhere.
+    let content = match image {
+        Some(url) => json!([
+            { "type": "text", "text": user_text },
+            { "type": "image_url", "image_url": { "url": url } },
+        ]),
+        None => json!(user_text),
     };
 
     let mut messages = vec![json!({ "role": "system", "content": SYSTEM_PROMPT })];
     messages.extend(chat.snapshot().iter().map(simplified));
-    messages.push(json!({ "role": "user", "content": user_text }));
+    messages.push(json!({ "role": "user", "content": content }));
     chat.push(json!({ "role": "user", "content": user_text }));
 
     let result = if provider.is_local() {
@@ -346,17 +357,18 @@ pub async fn send(
     }
 }
 
-/// File or window context folded into the first message as plain text. Text
-/// files are inlined; binary files are only named, as these endpoints take no
-/// document blocks.
-fn with_context(context: &ChatContext, query: &str) -> String {
+/// File or window context for the first message: the text to send, plus an
+/// image as a data URL. These endpoints take no document blocks, so a PDF is
+/// sent as its extracted text and a text file inline; an image goes as an
+/// image_url part, which vision models read.
+fn with_context(context: &ChatContext, query: &str) -> (String, Option<String>) {
     match context {
         ChatContext::Window { app_name, title, url } => {
             let mut prefix = format!("Context — App: {app_name}, Window: {title}");
             if let Some(url) = url {
                 prefix.push_str(&format!(", URL: {url}"));
             }
-            format!("{prefix}\n\n{query}")
+            (format!("{prefix}\n\n{query}"), None)
         }
         ChatContext::File { name, path } => {
             let ext = std::path::Path::new(path)
@@ -364,17 +376,51 @@ fn with_context(context: &ChatContext, query: &str) -> String {
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_lowercase();
-            let text = if BINARY_EXTS.contains(&ext.as_str()) {
+            if let Some(mime) = image_mime(&ext) {
+                let image = std::fs::metadata(path)
+                    .ok()
+                    .filter(|m| m.len() <= MAX_IMAGE_BYTES)
+                    .and_then(|_| std::fs::read(path).ok())
+                    .map(|bytes| format!("data:{mime};base64,{}", crate::claude::base64_for(&bytes)));
+                return (format!("File: {name}\n\n{query}"), image);
+            }
+            let text = if ext == "pdf" {
+                pdf_text(path)
+            } else if BINARY_EXTS.contains(&ext.as_str()) {
                 None
             } else {
-                std::fs::read_to_string(path).ok().filter(|t| !t.is_empty())
+                std::fs::read_to_string(path).ok()
             };
-            match text {
+            let text = match text.filter(|t| !t.trim().is_empty()) {
                 Some(text) => format!("File: {name}\n\n{}\n\n{query}", truncate_chars(&text, MAX_INLINE_CHARS)),
                 None => format!("File: {name}\n\n{query}"),
-            }
+            };
+            (text, None)
         }
     }
+}
+
+fn image_mime(ext: &str) -> Option<&'static str> {
+    match ext {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// A PDF's text through poppler's pdftotext, when it is installed. A scanned
+/// PDF has none, and comes back empty.
+fn pdf_text(path: &str) -> Option<String> {
+    let exe = crate::platform::find_on_path("pdftotext")?;
+    let out = std::process::Command::new(exe)
+        .args(["-layout", "-enc", "UTF-8", "--"])
+        .arg(path)
+        .arg("-")
+        .output()
+        .ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn truncate_chars(text: &str, max: usize) -> String {
