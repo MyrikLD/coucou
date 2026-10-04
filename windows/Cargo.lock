@@ -612,6 +612,7 @@ dependencies = [
 name = "coucou"
 version = "0.1.1"
 dependencies = [
+ "futures-lite",
  "gtk",
  "keyring",
  "libc",
@@ -624,6 +625,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tokio",
  "windows 0.61.3",
+ "zbus 5.19.0",
 ]
 
 [[package]]

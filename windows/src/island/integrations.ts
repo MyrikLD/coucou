@@ -37,6 +37,13 @@ export async function refreshConfigured() {
     data: {}, error: null, loaded: false, configured: false,
   };
   State.integrations.integration_claude = { ...claude, configured: hooks };
+  const music = State.integrations.integration_music ?? {
+    data: {}, error: null, loaded: false, configured: false,
+  };
+  State.integrations.integration_music = { ...music, configured: State.musicSupported };
+  State.resendReady =
+    (State.integrations.integration_resend?.configured ?? false) &&
+    ((await Bridge.secretPresent("resend-from")) ?? false);
   State.notify();
 }
 

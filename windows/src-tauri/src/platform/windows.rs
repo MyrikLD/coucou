@@ -1,7 +1,7 @@
 // Windows: Win32 for the island window and the cursor, %APPDATA% for files.
 
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tauri::{AppHandle, Manager, WebviewWindow};
@@ -27,6 +27,9 @@ pub const HOOK_EXE: &str = "coucou-hook.exe";
 
 /// Environment variable holding the home directory.
 pub const HOME_VAR: &str = "USERPROFILE";
+
+/// Where API keys are kept, as the settings window names it.
+pub const KEY_STORE: &str = "the Windows Credential Manager";
 
 /// Keeps spawned helpers from flashing a console window.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -233,3 +236,22 @@ pub fn set_activating(win: &WebviewWindow, activating: bool) {
 
 /// Click-through here is the poll's WS_EX_TRANSPARENT toggle, not a region.
 pub fn set_input_region(_win: &WebviewWindow, _rect: Option<(f64, f64, f64, f64)>) {}
+
+pub fn mail_client_available() -> bool {
+    false
+}
+
+pub fn compose_mail(_to: &str, _subject: &str, _body: &str, _attachment: Option<&Path>) -> Result<(), String> {
+    Err("Set up Resend in Settings to send files by email.".into())
+}
+
+pub fn open_terminal(_dir: Option<&str>) -> bool {
+    false
+}
+
+pub fn focus_window_of(_pid: u32) -> bool {
+    false
+}
+
+/// The Win32 cursor poll already reports the pointer leaving.
+pub fn watch_pointer_leave(_app: &AppHandle, _win: &WebviewWindow) {}

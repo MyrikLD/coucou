@@ -26,13 +26,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const FIRE_AND_FORGET_BUDGET: Duration = Duration::from_secs(2);
 /// How long a permission prompt may stay on screen before the terminal takes over.
 const DECISION_BUDGET: Duration = Duration::from_secs(110);
+/// A question gets a little longer; its hook entry allows 130 s.
+const QUESTION_BUDGET: Duration = Duration::from_secs(125);
 
 /// Fields that are pointless to forward and can be enormous (a whole file read,
 /// a full command output). The island never shows them.
-const DROPPED_FIELDS: &[&str] = &["tool_response", "transcript_path"];
+const DROPPED_FIELDS: &[&str] = &["tool_response"];
 /// Longest string forwarded for any single field; the island truncates to far
 /// less than this anyway.
 const MAX_FIELD_LEN: usize = 2_000;
+/// File edits carry their text whole up to this size, for the island's live
+/// diff — the same ceiling the diff itself has.
+const MAX_EDIT_LEN: usize = 200 * 1024;
+const EDIT_TOOLS: &[&str] = &["Edit", "MultiEdit", "Write"];
 
 #[cfg(windows)]
 mod win;
@@ -44,11 +50,33 @@ mod unix;
 #[cfg(target_os = "linux")]
 use unix::connect;
 
-fn main() {
-    let Some((payload, event)) = read_event() else { std::process::exit(0) };
+mod statusline;
 
-    let waits_for_answer = event == "PermissionRequest";
-    let budget = if waits_for_answer { DECISION_BUDGET } else { FIRE_AND_FORGET_BUDGET };
+fn main() {
+    if std::env::args().skip(1).any(|a| a == "--statusline") {
+        statusline::run();
+        std::process::exit(0);
+    }
+
+    // `--ask` is the PreToolUse hook matched on AskUserQuestion: the island
+    // answers the question and Claude Code gets the answers as the tool's input.
+    let ask = std::env::args().skip(1).any(|a| a == "--ask");
+
+    let Some(Event { line: payload, name: event, questions }) = read_event(ask) else {
+        std::process::exit(0)
+    };
+    if ask && questions.is_none() {
+        std::process::exit(0);
+    }
+
+    let waits_for_answer = ask || event == "PermissionRequest";
+    let budget = if ask {
+        QUESTION_BUDGET
+    } else if waits_for_answer {
+        DECISION_BUDGET
+    } else {
+        FIRE_AND_FORGET_BUDGET
+    };
 
     // The worker owns every blocking call. If it overruns the budget we simply
     // stop listening and exit: the process dying takes the pipe handle with it.
@@ -60,7 +88,11 @@ fn main() {
     });
 
     if let Ok(Some(decision)) = rx.recv_timeout(budget) {
-        if let Some(json) = decision_json(&decision) {
+        let output = match &questions {
+            Some(questions) => answers_json(&decision, questions),
+            None => decision_json(&decision),
+        };
+        if let Some(json) = output {
             let mut out = std::io::stdout();
             let _ = writeln!(out, "{json}");
             let _ = out.flush();
@@ -86,8 +118,43 @@ fn decision_json(decision: &str) -> Option<String> {
     ))
 }
 
+/// The documented way to answer AskUserQuestion from a PreToolUse hook: allow
+/// the tool with the answers filled into its input. `reply` is the island's
+/// `{"answers": {question: label | [labels]}}`; anything else prints nothing.
+fn answers_json(reply: &str, questions: &serde_json::Value) -> Option<String> {
+    let reply: serde_json::Value = serde_json::from_str(reply.trim()).ok()?;
+    let answers = reply.get("answers")?.as_object()?;
+    let valid = !answers.is_empty()
+        && answers.values().all(|v| match v {
+            serde_json::Value::String(s) => !s.is_empty(),
+            serde_json::Value::Array(items) => !items.is_empty() && items.iter().all(|i| i.is_string()),
+            _ => false,
+        });
+    if !valid {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": { "questions": questions, "answers": answers },
+            }
+        })
+        .to_string(),
+    )
+}
+
+struct Event {
+    /// The payload to forward, one JSON line.
+    line: String,
+    name: String,
+    /// `--ask` only: the AskUserQuestion questions, untruncated, to hand back.
+    questions: Option<serde_json::Value>,
+}
+
 /// Reads stdin and returns the payload to forward plus the event name.
-fn read_event() -> Option<(String, String)> {
+fn read_event(ask: bool) -> Option<Event> {
     let mut raw = Vec::new();
     if std::io::stdin().read_to_end(&mut raw).is_err() || raw.is_empty() {
         return None;
@@ -110,6 +177,8 @@ fn read_event() -> Option<(String, String)> {
         while let Some(arg) = it.next() {
             if arg == "--agent" {
                 agent = it.next().unwrap_or_default();
+            } else if arg.starts_with("--") {
+                continue;
             } else if arg_event.is_empty() {
                 arg_event = arg;
             }
@@ -127,6 +196,13 @@ fn read_event() -> Option<(String, String)> {
         .filter(|s| !s.is_empty())
         .unwrap_or(arg_event);
     map.insert("hook_event_name".into(), serde_json::Value::String(event.clone()));
+
+    let questions = if ask && map.get("tool_name").and_then(|v| v.as_str()) == Some("AskUserQuestion") {
+        map.insert("coucou_kind".into(), serde_json::Value::String("ask_user_question".into()));
+        map.get("tool_input").and_then(|i| i.get("questions")).filter(|q| q.is_array()).cloned()
+    } else {
+        None
+    };
 
     for field in DROPPED_FIELDS {
         map.remove(*field);
@@ -161,20 +237,41 @@ fn read_event() -> Option<(String, String)> {
         }
     }
 
-    truncate_strings(&mut payload);
+    // Lets the app walk up to the terminal window this session runs in.
+    #[cfg(unix)]
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("hook_ppid".into(), serde_json::Value::from(std::os::unix::process::parent_id()));
+    }
+
+    let is_edit = payload
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| EDIT_TOOLS.contains(&t));
+    let edit_input = if is_edit {
+        payload.as_object_mut().and_then(|m| m.remove("tool_input"))
+    } else {
+        None
+    };
+    truncate_strings(&mut payload, MAX_FIELD_LEN);
+    if let Some(mut input) = edit_input {
+        truncate_strings(&mut input, MAX_EDIT_LEN);
+        if let Some(map) = payload.as_object_mut() {
+            map.insert("tool_input".into(), input);
+        }
+    }
 
     let mut line = payload.to_string();
     line.push('\n');
-    Some((line, event))
+    Some(Event { line, name: event, questions })
 }
 
 /// Caps every string in the payload. A single Write can carry a whole file.
-fn truncate_strings(value: &mut serde_json::Value) {
+fn truncate_strings(value: &mut serde_json::Value, max: usize) {
     match value {
         serde_json::Value::String(s) => {
-            if s.len() > MAX_FIELD_LEN {
+            if s.len() > max {
                 // Cut on a char boundary; a lone byte index can split UTF-8.
-                let mut end = MAX_FIELD_LEN;
+                let mut end = max;
                 while end > 0 && !s.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -182,8 +279,8 @@ fn truncate_strings(value: &mut serde_json::Value) {
                 s.push('…');
             }
         }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(truncate_strings),
-        serde_json::Value::Object(map) => map.values_mut().for_each(truncate_strings),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| truncate_strings(v, max)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|v| truncate_strings(v, max)),
         _ => {}
     }
 }
@@ -246,9 +343,29 @@ mod tests {
     }
 
     #[test]
+    fn answers_go_back_as_the_tools_input() {
+        let questions = serde_json::json!([{ "question": "Which?", "options": [] }]);
+        let out = answers_json(r#"{"answers":{"Which?":"A","Many?":["x","y"]}}"#, &questions).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let o = &v["hookSpecificOutput"];
+        assert_eq!(o["hookEventName"], "PreToolUse");
+        assert_eq!(o["permissionDecision"], "allow");
+        assert_eq!(o["updatedInput"]["questions"], questions);
+        assert_eq!(o["updatedInput"]["answers"]["Many?"], serde_json::json!(["x", "y"]));
+    }
+
+    #[test]
+    fn a_malformed_answer_prints_nothing() {
+        let q = serde_json::json!([]);
+        for bad in ["", "allow", r#"{"answers":{}}"#, r#"{"answers":{"Q":1}}"#, r#"{"answers":{"Q":""}}"#] {
+            assert!(answers_json(bad, &q).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
     fn long_strings_are_cut_on_a_char_boundary() {
         let mut v = serde_json::json!({ "tool_input": { "content": "é".repeat(4000) } });
-        truncate_strings(&mut v);
+        truncate_strings(&mut v, MAX_FIELD_LEN);
         let s = v["tool_input"]["content"].as_str().unwrap();
         assert!(s.len() <= MAX_FIELD_LEN + 4);
         assert!(s.ends_with('…'));

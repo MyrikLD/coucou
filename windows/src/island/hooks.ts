@@ -5,7 +5,9 @@
 
 import { Bridge, onEvent } from "../core/bridge";
 import { Sound } from "../core/sound";
-import { State } from "../core/state";
+import { State, isSession, sessionTaskId } from "../core/state";
+import { parseQuestions } from "../core/ask";
+import { diffForTool, makeDiffStep } from "../core/diff";
 import type { Island } from "./island";
 
 const CLAUDE_ID = "integration_claude";
@@ -25,7 +27,18 @@ interface HookPayload {
   tool_input?: Record<string, unknown>;
   /** Optional agent tag: lowercase, digits and hyphens, ≤ 24 chars. */
   coucou_agent?: string;
+  /** The relay's parent process, inside the session's terminal (Linux). */
+  hook_ppid?: number;
+  /** The conversation's title, read from its transcript by the app. */
+  session_title?: string;
+  /** "ask_user_question" from coucou-hook --ask. */
+  coucou_kind?: string;
 }
+
+/** A finished or idle companion falls asleep after this long without events… */
+const SLEEP_AFTER_MS = 5 * 60_000;
+/** …and leaves after this long, in case its SessionEnd never came. */
+const LEAVE_AFTER_MS = 20 * 60_000;
 
 /** Same rule as HookServer.validateAgent on macOS. "claude" is reserved. */
 function validateAgent(raw: string | undefined): string | null {
@@ -132,12 +145,98 @@ function clearSession() {
   if (!t) return;
   t.steps = [];
   t.stepIndex = 0;
-  t.name = "VS Code";
+  t.name = "Claude Code";
   t.pillBadge = null;
+  State.diffs.delete(CLAUDE_ID);
+}
+
+/** Clears the question card if nobody answered before the relay gave up. */
+let questionTimeout: number | null = null;
+
+/** Hands an unanswered question back to the terminal. */
+export function releaseQuestion(island: Island) {
+  const q = State.pendingQuestion;
+  if (!q) return;
+  if (questionTimeout != null) window.clearTimeout(questionTimeout);
+  questionTimeout = null;
+  void Bridge.approvalDecline(q.requestId);
+  State.pendingQuestion = null;
+  State.isPinned = false;
+  island.dropPin();
+  State.updateTask(q.taskId, "working");
+  State.setPillBadge(q.taskId, null);
+}
+
+/** The island's answers go back through the relay as the tool's input. */
+export function answerQuestion(island: Island, answers: Record<string, string | string[]>) {
+  const q = State.pendingQuestion;
+  if (!q) return;
+  if (questionTimeout != null) window.clearTimeout(questionTimeout);
+  questionTimeout = null;
+  void Bridge.questionAnswer(q.requestId, answers);
+  State.pendingQuestion = null;
+  State.isPinned = false;
+  island.dropPin();
+  State.updateTask(q.taskId, "working");
+  State.setPillBadge(q.taskId, null);
+  Sound.play("approve");
+  island.setView(State.defaultView());
+}
+
+/** AskUserQuestion from coucou-hook --ask — handled like a permission request. */
+function handleQuestion(island: Island, payload: HookPayload, taskId: string, focused: boolean) {
+  const requestId = payload.request_id ?? "";
+  const items = parseQuestions(payload.tool_input);
+  // Malformed, or another card already up: the terminal asks instead.
+  if (!items || State.pendingQuestion || State.pendingApproval) {
+    if (requestId) void Bridge.approvalDecline(requestId);
+    return;
+  }
+  State.pendingQuestion = { requestId, taskId, items };
+  if (requestId) void Bridge.approvalAck(requestId);
+  State.updateTask(taskId, "question");
+  State.isPinned = true;
+  Sound.play("question");
+  if (focused) {
+    island.alert("question");
+  } else {
+    State.setPillBadge(taskId, "approval");
+    island.reveal();
+  }
+  questionTimeout = window.setTimeout(() => {
+    questionTimeout = null;
+    if (State.pendingQuestion?.requestId !== requestId) return;
+    State.pendingQuestion = null;
+    State.isPinned = false;
+    island.dropPin();
+    State.setPillBadge(taskId, null);
+    if (State.view === "question") island.setView(State.defaultView());
+    State.notify();
+  }, 124_000);
 }
 
 export function registerHookHandlers(island: Island) {
   void onEvent<HookPayload>("hook", (payload) => handleHook(island, payload));
+  window.setInterval(sweepSessions, 60_000);
+}
+
+/** Puts quiet companions to sleep and lets abandoned ones go. */
+function sweepSessions() {
+  const now = performance.now();
+  let changed = false;
+  for (const t of [...State.tasks]) {
+    if (!isSession(t.id) || t.lastEvent == null) continue;
+    if (State.pendingApproval?.taskId === t.id) continue;
+    const quiet = now - t.lastEvent;
+    if (quiet > LEAVE_AFTER_MS) {
+      State.removeTask(t.id);
+      changed = true;
+    } else if (quiet > SLEEP_AFTER_MS && (t.state === "idle" || t.state === "finished")) {
+      t.state = "sleeping";
+      changed = true;
+    }
+  }
+  if (changed) State.notify();
 }
 
 function handleHook(island: Island, payload: HookPayload) {
@@ -154,11 +253,18 @@ function handleHook(island: Island, payload: HookPayload) {
   const raw = lastPathComponent(cwd);
   const projectName = aliasProjectName(raw || "Session");
 
-  // Route to the right pill. Valid coucou_agent → dynamic "agent_<name>" pill.
-  // "claude" is reserved; absent or invalid → Claude Code pill unchanged.
+  // Route to the right pill. Valid coucou_agent → dynamic "agent_<name>" pill
+  // ("claude" is reserved). Otherwise every Claude Code session gets its own
+  // companion; a payload without a session id lands on the Claude Code pill.
   const validAgent = validateAgent(payload.coucou_agent);
-  const agentId = validAgent ? `agent_${validAgent}` : CLAUDE_ID;
   const isExternalAgent = validAgent !== null;
+  const sessionId = !isExternalAgent && name !== "SessionEnd" ? payload.session_id ?? "" : "";
+  const session = sessionId ? State.upsertSession(sessionId, projectName, cwd, payload.session_title) : null;
+  if (session && payload.hook_ppid) session.sessionPid = payload.hook_ppid;
+  const endingId = name === "SessionEnd" && payload.session_id
+    ? State.tasks.find((t) => t.id === sessionTaskId(payload.session_id!))?.id
+    : undefined;
+  const agentId = validAgent ? `agent_${validAgent}` : session?.id ?? endingId ?? CLAUDE_ID;
 
   const focused = State.focusId === agentId;
 
@@ -173,14 +279,20 @@ function handleHook(island: Island, payload: HookPayload) {
     }
   };
 
-  /** Ensure the agent pill exists (no-op for Claude Code). */
+  /** Ensure the agent pill exists; session companions already do. */
   const ensurePill = () => {
     if (isExternalAgent) {
       State.upsertExternalAgent(agentId, validAgent!, agentColor(validAgent!));
-    } else {
+    } else if (!session) {
       upsert(projectName, cwd);
     }
   };
+
+  if (payload.coucou_kind === "ask_user_question") {
+    handleQuestion(island, payload, agentId, focused);
+    State.notify();
+    return;
+  }
 
   switch (name) {
     case "SessionStart":
@@ -201,9 +313,17 @@ function handleHook(island: Island, payload: HookPayload) {
 
     case "PreToolUse": {
       ensurePill();
-      State.updateTask(agentId, "working");
       const tool = payload.tool_name ?? "Tool";
-      State.appendStep(agentId, stepLabel(tool, payload.tool_input ?? {}));
+      // The question card covers it, from its own hook.
+      if (tool === "AskUserQuestion") break;
+      State.updateTask(agentId, "working");
+      const diff = diffForTool(tool, payload.tool_input ?? {});
+      if (diff) {
+        State.addDiff(agentId, diff);
+        State.appendStep(agentId, makeDiffStep(diff));
+      } else {
+        State.appendStep(agentId, stepLabel(tool, payload.tool_input ?? {}));
+      }
       surface("overview", false);
       break;
     }
@@ -239,7 +359,7 @@ function handleHook(island: Island, payload: HookPayload) {
       window.setTimeout(() => {
         if (isExternalAgent) {
           State.removeTask(agentId);
-        } else {
+        } else if (State.tasks.find((t) => t.id === agentId)?.state === "finished") {
           State.updateTask(agentId, "idle");
           State.setPillBadge(agentId, null);
         }
@@ -254,7 +374,7 @@ function handleHook(island: Island, payload: HookPayload) {
       break;
 
     case "SessionEnd":
-      if (isExternalAgent) {
+      if (isExternalAgent || isSession(agentId)) {
         State.removeTask(agentId);
       } else {
         State.updateTask(agentId, "idle");
@@ -287,20 +407,21 @@ function handleHook(island: Island, payload: HookPayload) {
         if (requestId) void Bridge.approvalDecline(requestId);
         break;
       }
-      upsert(projectName, cwd);
+      ensurePill();
       if (pendingTimeout != null) window.clearTimeout(pendingTimeout);
       const tool = payload.tool_name ?? "Tool";
       const input = payload.tool_input ?? {};
       State.pendingApproval = {
         requestId,
         sessionId: payload.session_id ?? "",
+        taskId: agentId,
         tool,
         command: approvalTarget(tool, input),
       };
       // The relay's short ack window closes in 800 ms; everything below this
       // line is synchronous, so the card really is up by the time it lands.
       if (requestId) void Bridge.approvalAck(requestId);
-      State.updateTask(CLAUDE_ID, "approval");
+      State.updateTask(agentId, "approval");
       State.isPinned = true;
       Sound.play("approval");
       if (focused) {
@@ -309,7 +430,7 @@ function handleHook(island: Island, payload: HookPayload) {
         // Another agent holds the view, so the card would yank it away. The badge
         // is the signal instead — but it has to be on screen for that to mean
         // anything, hence the reveal. We just told the relay a human can act.
-        State.setPillBadge(CLAUDE_ID, "approval");
+        State.setPillBadge(agentId, "approval");
         island.reveal();
       }
       // Coucou answers within 108 s or not at all; after that the terminal has
@@ -320,8 +441,8 @@ function handleHook(island: Island, payload: HookPayload) {
         State.pendingApproval = null;
         State.isPinned = false;
         island.dropPin();
-        State.updateTask(CLAUDE_ID, "working");
-        State.setPillBadge(CLAUDE_ID, null);
+        State.updateTask(agentId, "working");
+        State.setPillBadge(agentId, null);
         if (State.view === "approval") island.setView(State.defaultView());
         State.notify();
       }, 110_000);

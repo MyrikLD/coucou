@@ -2,7 +2,7 @@
 // Mirrors IslandRootView.swift + IslandWindowController.swift.
 
 import { Tracked, Spring, clamp } from "../core/anim";
-import { Bridge, IS_TAURI, onDragDrop } from "../core/bridge";
+import { Bridge, IS_TAURI, onDragDrop, onEvent } from "../core/bridge";
 import {
   EXPANDED_CORNER, EXPANDED_W, NOTCH_W, PANEL_H, PANEL_W,
   ROUNDED_CORNER, VIEW_LAYOUTS, botGlowColor, botGlowOpacity, botPosition, chatPromptHeight,
@@ -10,14 +10,17 @@ import {
   type IslandMode, type IslandViewName,
 } from "../core/layout";
 import { Sound } from "../core/sound";
-import { State } from "../core/state";
+import { State, isSession, type AgentTask } from "../core/state";
 import { BotEngine, hexToRGB } from "../mochi/engine";
 import { Greeting } from "../mochi/greeting";
-import { createMiniBot, pruneMiniBots, syncMiniBotStates, tickMiniBots } from "../mochi/minibots";
+import { createMiniBot, miniBotCount, pruneMiniBots, syncMiniBotStates, tickMiniBots } from "../mochi/minibots";
 import { UploadCanvas } from "../upload/canvas";
 import { USC, UploadSeq } from "../upload/sequence";
 import { buildHeader, buildViews, type ViewActions, type ViewHost } from "../views/views";
 import { h } from "../views/dom";
+import { leaveWardrobe } from "../views/wardrobe";
+import { answerQuestion, releaseQuestion } from "./hooks";
+import { parseOutfit } from "../mochi/outfits";
 import { IslandStateMachine } from "./fsm";
 
 const BOT_OVERHANG = 40;
@@ -27,8 +30,20 @@ const HIT_MARGIN = 14;
 /** The three views the drop sequence owns; leaving them stops the engine. */
 const UPLOAD_VIEWS: ReadonlySet<IslandViewName> = new Set(["upload", "uploading", "choose"]);
 
+/** Views with a text field: the only ones that take keyboard focus. */
+const TEXT_VIEWS: ReadonlySet<IslandViewName> = new Set(["prompt", "mail"]);
+
 /** Seconds between the drop and the moment the progress bar starts filling. */
 const PRE_PROGRESS = USC.T_PROG_START - USC.T_DROP;
+
+/**
+ * "Open terminal" for a session: its own terminal window when the compositor
+ * can be asked to focus it, otherwise the folder in an editor or a new terminal.
+ */
+async function openSessionTerminal(task: AgentTask | null) {
+  if (task?.sessionPid && (await Bridge.focusSessionWindow(task.sessionPid))) return;
+  void Bridge.openInVSCode(task?.sessionCwd ?? null);
+}
 
 const modeOrder = (m: IslandMode) => (m === "hidden" ? 0 : m === "compact" ? 1 : 2);
 
@@ -83,6 +98,8 @@ export class Island {
   private confusedRecovery: number | null = null;
   private prevViewBeforeConfused: IslandViewName = "overview";
   private lastSyncedView: IslandViewName | null = null;
+  /** Set for a reveal that must not play the peek sound (music starting). */
+  private silentReveal = false;
 
   /** Drop sequence bookkeeping: last tick played, and whether the ✓ has fired. */
   private uploadTens = 0;
@@ -108,13 +125,16 @@ export class Island {
       setView: (v) => this.setView(v),
       collapse: () => this.collapse(),
       setFocus: (id) => {
+        // setFocus clears the badge, so read it first: a pill asking for
+        // permission opens straight onto its card.
+        const asking = State.pendingApproval?.taskId === id;
+        const questioning = State.pendingQuestion?.taskId === id;
         State.setFocus(id);
         Sound.play("blip");
+        if (asking) this.setView("approval");
+        else if (questioning) this.setView("question");
       },
-      openTerminal: () => {
-        const cwd = State.focusTask?.sessionCwd ?? null;
-        void Bridge.openInVSCode(cwd);
-      },
+      openTerminal: () => void openSessionTerminal(State.focusTask),
       // The ↗ button — same targets as openAgentTarget() on macOS.
       openTarget: () => {
         const task = State.focusTask;
@@ -127,8 +147,9 @@ export class Island {
           integration_notion: "https://notion.so",
           integration_calcom: "https://app.cal.com/bookings",
         };
-        if (task.id === "integration_claude") void Bridge.openInVSCode(task.sessionCwd ?? null);
+        if (task.id === "integration_claude" || isSession(task.id)) void openSessionTerminal(task);
         else if (task.id === "integration_n8n") void Bridge.openN8n();
+        else if (task.id === "integration_music") void Bridge.musicControl("raise");
         else if (urls[task.id]) void Bridge.openUrl(urls[task.id]);
       },
       openUrl: (url) => {
@@ -143,8 +164,8 @@ export class Island {
         State.pendingApproval = null;
         State.isPinned = false;
         this.fsm.pinned = false;
-        State.updateTask("integration_claude", "working");
-        State.setPillBadge("integration_claude", null);
+        State.updateTask(req.taskId, "working");
+        State.setPillBadge(req.taskId, null);
         this.setView(State.defaultView());
       },
       toggleSound: () => {
@@ -167,6 +188,20 @@ export class Island {
       },
       openSettingsWindow: () => void Bridge.openSettingsWindow(),
       blip: () => Sound.play("blip"),
+      emote: (name) => this.engine.triggerEmote(name),
+      answerQuestion: (answers) => answerQuestion(this, answers),
+      replyInTerminal: () => {
+        releaseQuestion(this);
+        this.setView(State.defaultView());
+      },
+      chooseOutfit: (selection) => {
+        if (parseOutfit(State.settings.outfit) === selection) return;
+        State.settings.outfit = selection;
+        void Bridge.saveSettings(State.settings);
+        Sound.play("pop");
+        this.engine.triggerEmote("proud");
+        State.notify();
+      },
     };
 
     this.wakeStrip = h("div", { id: "wake-strip" });
@@ -191,7 +226,7 @@ export class Island {
           : null;
         this.setView("prompt");
       },
-      cancel: () => this.setView(State.defaultView()),
+      secondary: () => this.setView(State.mailAvailable ? "mail" : State.defaultView()),
     });
 
     this.clipEl = h(
@@ -232,7 +267,7 @@ export class Island {
           break;
         case "petit":
           if (from === "coucou") this.greeting.interrupt();
-          else if (from === "hidden") Sound.play("peek");
+          else if (from === "hidden" && !this.silentReveal) Sound.play("peek");
           this.setMode("compact");
           if (from === "coucou") State.view = State.defaultView();
           if (!this.wasInIsland) this.fsm.mouseLeft();
@@ -263,6 +298,7 @@ export class Island {
     if (mode === "expanded") Sound.play("open");
     if (prev === "expanded") {
       Sound.play("close");
+      leaveWardrobe();
       State.isPinned = false;
       void Bridge.focusWindow(false);
     }
@@ -332,6 +368,13 @@ export class Island {
 
   reveal() {
     this.fsm.reveal();
+  }
+
+  /** Music started playing: peek out without the peek sound, as on macOS. */
+  revealSilently() {
+    this.silentReveal = true;
+    this.fsm.reveal();
+    this.silentReveal = false;
   }
 
   /** An alert stopped waiting for an answer: let the island auto-close again. */
@@ -450,7 +493,10 @@ export class Island {
   // ── Geometry ────────────────────────────────────────────────────────────────
 
   private targetSize(): { w: number; h: number; r: number } {
-    const { w, h } = islandSize(State.mode, State.view, State.chatHistory.length);
+    const size = islandSize(State.mode, State.view, State.chatHistory.length);
+    const { w } = size;
+    // The model picker needs the chat at its tallest to show a usable list.
+    const h = State.view === "prompt" && State.chatPickerOpen ? PANEL_H - 20 : size.h;
     const r = State.mode === "expanded" ? EXPANDED_CORNER : ROUNDED_CORNER;
     return { w, h, r };
   }
@@ -532,6 +578,8 @@ export class Island {
     });
 
     this.islandEl.addEventListener("mousedown", (e) => {
+      // Right-click belongs to the wardrobe (contextmenu below).
+      if (e.button !== 0) return;
       Sound.resume();
       State.lastActivity = performance.now();
       if (State.mode !== "expanded") {
@@ -544,8 +592,23 @@ export class Island {
       }
     });
 
+    // Right-click on Mochi opens the wardrobe, and closes it again.
+    this.islandEl.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      if (!this.isBotHit(e.clientX, e.clientY)) return;
+      Sound.resume();
+      State.lastActivity = performance.now();
+      if (State.mode === "expanded" && State.view === "wardrobe") {
+        this.setView(State.defaultView());
+      } else {
+        this.setView("wardrobe");
+      }
+    });
+
     window.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && State.mode === "expanded" && !State.isPinned) this.collapse();
+      if (e.key === "Escape" && State.mode === "expanded" && State.view === "wardrobe") {
+        this.setView(State.defaultView());
+      } else if (e.key === "Escape" && State.mode === "expanded" && !State.isPinned) this.collapse();
       State.lastActivity = performance.now();
     });
 
@@ -563,9 +626,21 @@ export class Island {
    * reported as a cursor far away, which is what the poll would have said.
    */
   followPageCursor() {
-    window.addEventListener("mousemove", (e) => this.onCursor(e.clientX, e.clientY));
+    // GTK's crossings are the truth: WebKit replays a stale mousemove after a
+    // relayout, so moves only count while the pointer is really over us.
+    let inside = true;
+    window.addEventListener("mousemove", (e) => {
+      if (inside) this.onCursor(e.clientX, e.clientY);
+    });
     window.addEventListener("mouseout", (e) => {
       if (e.relatedTarget == null) this.onCursor(-10_000, -10_000);
+    });
+    void onEvent<null>("pointer-left", () => {
+      inside = false;
+      this.onCursor(-10_000, -10_000);
+    });
+    void onEvent<null>("pointer-entered", () => {
+      inside = true;
     });
   }
 
@@ -733,7 +808,9 @@ export class Island {
       ? settling
       : settling ||
         !this.botCx.settled || !this.botCy.settled || !this.botSize.settled ||
-        greetingActive || this.engine.busy || UploadSeq.isActive;
+        greetingActive || this.engine.busy || UploadSeq.isActive ||
+        (this.views.get(State.view)?.busy?.() ?? false) ||
+        (this.miniBotsOnScreen && miniBotCount() > 0);
 
     if (busy) {
       requestAnimationFrame(this.frame);
@@ -742,6 +819,11 @@ export class Island {
       Sound.idle();
     }
   };
+
+  /** The pills' Mochis (overview) or the compact grid are visible and alive. */
+  private get miniBotsOnScreen(): boolean {
+    return State.mode === "compact" || (State.mode === "expanded" && State.view === "overview");
+  }
 
   private updateBotTargets() {
     const p = botPosition(State.mode, State.view, this.height.value, State.uploadProgress);
@@ -788,10 +870,17 @@ export class Island {
     if (!ctx) return;
 
     const focus = State.focusTask;
-    this.engine.bodyColor = focus?.isIntegration ? hexToRGB(focus.color) : null;
+    this.engine.bodyColor = focus && (focus.isIntegration || isSession(focus.id)) ? hexToRGB(focus.color) : null;
+    // The outfit belongs to Mochi itself: it comes off while another pill is in focus.
+    const inWardrobe = State.mode === "expanded" && State.view === "wardrobe";
+    const focusMain =
+      State.focusId == null || State.focusId === "integration_claude" || isSession(State.focusId);
+    const dressed = focusMain || State.mode !== "expanded" || inWardrobe;
+    this.engine.setOutfit(dressed ? State.resolvedOutfit : "none", State.view !== "wardrobe");
     this.engine.particleOverhang = BOT_OVERHANG;
     this.engine.lookX = this.lookX();
     this.engine.lookY = this.lookY();
+    this.engine.setDancing(this.shouldDance());
     if (this.engine.morph > 0.3) {
       this.engine.slotHTarget = State.fileDragOver ? 0.2 : 0;
     } else {
@@ -805,6 +894,15 @@ export class Island {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, hCss);
     this.engine.draw(ctx, w, hCss);
+  }
+
+  /** BotCanvasView's `dancing`: calm states only, in the compact island or on the music card. */
+  private shouldDance(): boolean {
+    if (!State.musicPlaying || !State.settings.activeIntegrations.includes("integration_music")) return false;
+    const calm = ["idle", "working", "thinking", "searching", "finished"];
+    if (!calm.includes(State.effectiveState)) return false;
+    if (State.mode === "compact") return true;
+    return State.mode === "expanded" && State.view === "overview" && State.focusId === "integration_music";
   }
 
   /** BotCanvasView.lookX / lookY — tanh of the distance to the bot. */
@@ -847,15 +945,18 @@ export class Island {
       if (on) view.sync();
     }
 
-    // The chat is the only view with a text field, so it is the only time the
-    // island is allowed to take keyboard focus.
+    // Only the views with text fields may take keyboard focus.
     if (this.lastSyncedView !== State.view) {
-      const wasChat = this.lastSyncedView === "prompt";
+      const hadFocus = this.lastSyncedView != null && TEXT_VIEWS.has(this.lastSyncedView);
+      if (this.lastSyncedView === "wardrobe") leaveWardrobe();
+      // Leaving the question unanswered hands it back to the terminal, as on macOS.
+      if (this.lastSyncedView === "question" && State.pendingQuestion) releaseQuestion(this);
       this.lastSyncedView = State.view;
-      if (State.view === "prompt") {
+      if (TEXT_VIEWS.has(State.view)) {
+        const view = State.view;
         void Bridge.focusWindow(true);
-        window.setTimeout(() => this.views.get("prompt")?.focus?.(), 120);
-      } else if (wasChat) {
+        window.setTimeout(() => this.views.get(view)?.focus?.(), 120);
+      } else if (hadFocus) {
         void Bridge.focusWindow(false);
       }
     }

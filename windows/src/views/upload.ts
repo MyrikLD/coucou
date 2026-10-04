@@ -1,8 +1,8 @@
 // Drop zone, upload progress and the "what do you want to do with it" card —
 // ports of UploadView / UploadingView / ChooseView from IslandViewContent.swift.
 //
-// Sending a file by email is not in the Windows v1, so `choose` offers the one
-// action the spec asks for: ask a question about it.
+// `choose` offers "Send by email" when there is a way to send it (Resend or a
+// desktop mail client), and Cancel otherwise.
 
 import { h, clear } from "./dom";
 import { State } from "../core/state";
@@ -86,6 +86,10 @@ export function buildUploading(): ViewHost {
 export function buildChoose(actions: ViewActions): ViewHost {
   const title = h("div", { class: "title" });
   const sub = h("div", { class: "sub", text: "What do you want to do with it?" });
+  const secondary = h("button", {
+    class: "btn secondary",
+    onclick: () => actions.setView(State.mailAvailable ? "mail" : State.defaultView()),
+  });
   const row = h(
     "div",
     { class: "actions" },
@@ -94,11 +98,7 @@ export function buildChoose(actions: ViewActions): ViewHost {
       text: "Ask a question",
       onclick: () => actions.setView("prompt"),
     }),
-    h("button", {
-      class: "btn secondary",
-      text: "Cancel",
-      onclick: () => actions.setView(State.defaultView()),
-    }),
+    secondary,
   );
   const el = h(
     "div",
@@ -113,6 +113,7 @@ export function buildChoose(actions: ViewActions): ViewHost {
   return {
     el,
     sync() {
+      secondary.textContent = State.mailAvailable ? "Send by email" : "Cancel";
       clear(title);
       title.append(
         h("b", { text: State.droppedFile?.name ?? "file" }),

@@ -2,14 +2,19 @@
 
 mod claude;
 mod files;
+mod github;
 mod hooks;
 mod integrations;
 mod island;
 mod log;
+mod mail;
+mod music;
 mod pipe;
 mod platform;
+mod providers;
 mod secrets;
 mod settings;
+mod titles;
 mod tray;
 
 use std::process::Command;
@@ -25,6 +30,7 @@ use files::DroppedFile;
 use hooks::{HookPreview, HookStatus};
 use island::{PollGate, ScreenInfo};
 use pipe::Pending;
+use providers::{LocalProbe, ModelInfo, Provider};
 use settings::Settings;
 
 pub struct Shared {
@@ -42,6 +48,9 @@ pub struct BootInfo {
     /// False where the OS has no global cursor (Wayland): the page then reports
     /// the cursor from its own mouse events.
     cursor_poll: bool,
+    key_store: String,
+    /// Whether "Send by email" can fall back to the desktop's mail client.
+    mail_client: bool,
 }
 
 #[tauri::command]
@@ -56,6 +65,8 @@ fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         hook_path: settings::hook_exe_path().to_string_lossy().to_string(),
         cursor_poll: platform::CURSOR_POLL,
+        key_store: platform::KEY_STORE.to_string(),
+        mail_client: platform::mail_client_available(),
     }
 }
 
@@ -133,7 +144,7 @@ fn open_url(url: String) {
 }
 
 /// "Open terminal" opens the working folder in VS Code when `code` is on PATH,
-/// and falls back to the file manager otherwise.
+/// else in a terminal emulator, and falls back to the file manager.
 #[tauri::command]
 fn open_in_vscode(path: Option<String>) -> bool {
     // No shell anywhere near this. The path is a project folder chosen by
@@ -159,10 +170,40 @@ fn open_in_vscode(path: Option<String>) -> bool {
             return true;
         }
     }
+    if platform::open_terminal(path.as_deref()) {
+        return true;
+    }
     if let Some(p) = path.as_deref() {
         platform::reveal_folder(p);
     }
     false
+}
+
+/// The diff card's ↗: the edited file, in VS Code when `code` is on PATH,
+/// else with whatever the desktop opens it with.
+#[tauri::command]
+fn open_file(path: String) -> bool {
+    // A path from a hook payload: only an existing file, by its full path, and
+    // never one that `code` could read as an option.
+    let p = std::path::Path::new(&path);
+    if !(p.is_absolute() && p.is_file()) {
+        return false;
+    }
+    if let Some(code) = platform::find_on_path("code") {
+        let mut cmd = Command::new(code);
+        cmd.arg("--").arg(&path);
+        if platform::no_console(&mut cmd).spawn().is_ok() {
+            return true;
+        }
+    }
+    platform::reveal_folder(&path);
+    true
+}
+
+/// "Open terminal" for a session: brings its own terminal window forward.
+#[tauri::command]
+fn focus_session_window(pid: u32) -> bool {
+    platform::focus_window_of(pid)
 }
 
 #[tauri::command]
@@ -212,6 +253,31 @@ fn hooks_apply(
 }
 
 #[tauri::command]
+fn statusline_status() -> bool {
+    hooks::statusline_installed()
+}
+
+/// The plan usage relay's diff, shown before anything is written.
+#[tauri::command]
+fn statusline_preview(install: bool) -> Result<HookPreview, String> {
+    hooks::statusline_preview(install)
+}
+
+/// Only ever called from an explicit click in the settings window.
+#[tauri::command]
+fn statusline_apply(app: AppHandle, install: bool, fingerprint: String) -> Result<String, String> {
+    let backup = hooks::statusline_write(install, &fingerprint)?;
+    let _ = app.emit("statusline-changed", install);
+    Ok(backup)
+}
+
+/// The question card's answers: `{question: label | [labels]}`.
+#[tauri::command]
+fn question_answer(app: AppHandle, request_id: String, answers: serde_json::Value) {
+    pipe::answer_question(&app, &request_id, answers);
+}
+
+#[tauri::command]
 fn approval_decision(app: AppHandle, request_id: String, decision: String) {
     pipe::answer(&app, &request_id, &decision);
 }
@@ -236,13 +302,30 @@ fn approval_decline(app: AppHandle, request_id: String) {
 /// One chat turn. The API key and any file bytes stay on the Rust side.
 #[tauri::command]
 async fn chat_send(
+    app: AppHandle,
     shared: State<'_, Shared>,
     chat: State<'_, Chat>,
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let model = shared.settings.lock().unwrap().model.clone();
-    claude::send(&chat, &model, query, context).await
+    let settings = shared.settings.lock().unwrap().clone();
+    match Provider::parse(&settings.chat_provider) {
+        Provider::Anthropic => claude::send(&chat, &settings.model, query, context).await,
+        provider => providers::send(&app, &chat, &settings, provider, query, context).await,
+    }
+}
+
+/// Settings → Connect for Ollama / LM Studio. Nothing is saved here.
+#[tauri::command]
+async fn chat_probe_local(provider: String, url: String) -> Result<LocalProbe, String> {
+    providers::probe_local(Provider::parse(&provider), &url).await
+}
+
+/// Models for the picker above the chat box.
+#[tauri::command]
+async fn chat_models(shared: State<'_, Shared>, provider: String) -> Result<Vec<ModelInfo>, String> {
+    let settings = shared.settings.lock().unwrap().clone();
+    providers::list_models(&settings, Provider::parse(&provider)).await
 }
 
 #[tauri::command]
@@ -254,6 +337,17 @@ fn chat_reset(chat: State<Chat>) {
 #[tauri::command]
 fn ingest_file(path: String) -> Result<DroppedFile, String> {
     files::ingest(&path)
+}
+
+/// The mail card's Send button.
+#[tauri::command]
+async fn send_mail(
+    to: String,
+    subject: String,
+    body: String,
+    attachment: Option<String>,
+) -> Result<mail::MailOutcome, String> {
+    mail::send(&to, &subject, &body, attachment.as_deref()).await
 }
 
 /// The island may only ask whether a key exists — never read it.
@@ -284,6 +378,24 @@ fn open_n8n() {
 #[tauri::command]
 async fn refresh_integration(app: AppHandle, id: String) {
     integrations::poll_once(app, &id).await;
+}
+
+// ── Now playing ───────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn music_supported() -> bool {
+    music::SUPPORTED
+}
+
+#[tauri::command]
+fn music_state() -> Option<music::Track> {
+    music::snapshot()
+}
+
+/// playPause / next / previous / raise, sent to the player the pill shows.
+#[tauri::command]
+async fn music_control(action: String) {
+    music::control(&action).await;
 }
 
 /// Lets the island write to the same log as the Rust side.
@@ -383,17 +495,26 @@ pub fn run() {
             reposition,
             open_url,
             open_in_vscode,
+            focus_session_window,
+            open_file,
             quit_app,
             hooks_status,
             hooks_preview,
             hooks_apply,
+            statusline_status,
+            statusline_preview,
+            statusline_apply,
             approval_decision,
+            question_answer,
             approval_ack,
             approval_decline,
             log_line,
             chat_send,
+            chat_models,
+            chat_probe_local,
             chat_reset,
             ingest_file,
+            send_mail,
             secret_present,
             secret_set,
             secret_clear,
@@ -401,6 +522,9 @@ pub fn run() {
             open_n8n,
             open_settings_window,
             set_paused,
+            music_supported,
+            music_state,
+            music_control,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -410,6 +534,7 @@ pub fn run() {
 
             if let Some(win) = island::window(&handle) {
                 platform::make_non_activating(&win);
+                platform::watch_pointer_leave(&handle, &win);
                 island::apply_geometry(&handle, &loaded.screen, false);
                 let _ = win.show();
             }
@@ -426,6 +551,7 @@ pub fn run() {
             hooks::ensure_hook_exe(&handle);
             pipe::start(handle.clone());
             integrations::start(handle.clone());
+            music::start(handle.clone());
             Ok(())
         })
         .run(tauri::generate_context!())

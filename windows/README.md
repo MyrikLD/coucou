@@ -176,6 +176,9 @@ What changes on Linux:
   Unix socket at `$XDG_RUNTIME_DIR/coucou.sock`. Both ends check that the other
   runs as the same user.
 - **Keys** live in the Secret Service (GNOME Keyring, KWallet).
+- **Music** is a pill for whatever an MPRIS player is playing (Spotify, a
+  browser, mpv…), with play, pause and skip. It stands in for the Mac's Apple
+  Music pill, and Mochi dances along the same way.
 - **Files**: preferences in `~/.config/coucou/`, the log at
   `~/.local/share/coucou/coucou.log`.
 - What the Windows build leaves out, this one does too: sending a file by

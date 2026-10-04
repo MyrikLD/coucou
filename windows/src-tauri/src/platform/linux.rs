@@ -28,6 +28,9 @@ pub const HOOK_EXE: &str = "coucou-hook";
 /// Environment variable holding the home directory.
 pub const HOME_VAR: &str = "HOME";
 
+/// Where API keys are kept, as the settings window names it.
+pub const KEY_STORE: &str = "the Secret Service";
+
 // ── Files ─────────────────────────────────────────────────────────────────────
 
 /// An XDG base directory (`$XDG_CONFIG_HOME` …), or its fallback under the home
@@ -134,6 +137,86 @@ pub fn reveal_folder(path: &str) {
     let _ = Command::new("xdg-open").arg(path).spawn();
 }
 
+/// A terminal emulator in `dir` (home when None): $TERMINAL first, then the
+/// usual ones. The folder is the child's working directory, which every one of
+/// them starts its shell in.
+pub fn open_terminal(dir: Option<&str>) -> bool {
+    const KNOWN: &[&str] = &[
+        "kitty", "foot", "alacritty", "wezterm", "ghostty", "konsole", "gnome-terminal",
+        "xfce4-terminal", "xterm",
+    ];
+    let preferred = std::env::var("TERMINAL").ok().filter(|t| !t.is_empty() && !t.contains('/'));
+    let Some(exe) = preferred.iter().map(String::as_str).chain(KNOWN.iter().copied()).find_map(find_on_path) else {
+        return false;
+    };
+    let dir = dir.map(PathBuf::from).unwrap_or_else(home_dir);
+    Command::new(exe).current_dir(dir).spawn().is_ok()
+}
+
+/// Focuses the Hyprland window that `pid` runs under: the first ancestor of the
+/// process that owns a client window, which for a CLI session is its terminal.
+pub fn focus_window_of(pid: u32) -> bool {
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+        return false;
+    }
+    let Some(hyprctl) = find_on_path("hyprctl") else { return false };
+    let Ok(out) = Command::new(&hyprctl).args(["clients", "-j"]).output() else { return false };
+    let Ok(clients) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else { return false };
+    let windows: std::collections::HashSet<u32> = clients
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|c| c.get("pid").and_then(serde_json::Value::as_u64))
+                .map(|p| p as u32)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut current = pid;
+    for _ in 0..32 {
+        if windows.contains(&current) {
+            return Command::new(&hyprctl)
+                .args(["dispatch", "focuswindow", &format!("pid:{current}")])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        }
+        match parent_pid(current) {
+            Some(parent) if parent > 1 => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The parent from /proc/<pid>/stat. The command name sits in parentheses and
+/// may itself contain spaces or ')', so the fields are read after the last ')'.
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+pub fn mail_client_available() -> bool {
+    find_on_path("xdg-email").is_some()
+}
+
+/// Opens a new message in the desktop's mail client; the user sends it from
+/// there. `to` was checked by the caller and cannot pass for an option.
+pub fn compose_mail(to: &str, subject: &str, body: &str, attachment: Option<&Path>) -> Result<(), String> {
+    let exe = find_on_path("xdg-email").ok_or_else(|| "No mail client found (xdg-email is missing).".to_string())?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("--utf8").arg("--subject").arg(subject);
+    if !body.is_empty() {
+        cmd.arg("--body").arg(body);
+    }
+    if let Some(file) = attachment {
+        cmd.arg("--attach").arg(file);
+    }
+    cmd.arg(to);
+    cmd.spawn().map(|_| ()).map_err(|e| format!("Couldn't open the mail client: {e}"))
+}
+
 /// Our own `which`: the first executable file named `stem` on $PATH.
 pub fn find_on_path(stem: &str) -> Option<PathBuf> {
     let dirs = std::env::var_os("PATH")?;
@@ -208,6 +291,37 @@ pub fn unblock_webview_drops(_app: &AppHandle) {}
 /// Without layer-shell (GNOME, X11, or COUCOU_LAYER_SHELL=0) the window stays
 /// an ordinary always-on-top window that refuses focus; where it lands is then
 /// up to the window manager.
+/// WebKit sends the page no mouseout when the pointer leaves the island's input
+/// region, and after a relayout it replays a mousemove at the pointer's last
+/// position, which reads as the mouse coming back. Either way the island never
+/// starts its auto-close. GTK sees the real crossings: hand them to the page.
+/// Every widget in the window is watched, since whichever one is under the
+/// pointer is the one that receives the crossing.
+pub fn watch_pointer_leave(app: &AppHandle, win: &WebviewWindow) {
+    fn watch(widget: &gtk::Widget, app: &AppHandle) {
+        widget.add_events(gtk::gdk::EventMask::LEAVE_NOTIFY_MASK | gtk::gdk::EventMask::ENTER_NOTIFY_MASK);
+        let emitter = app.clone();
+        widget.connect_leave_notify_event(move |_, event| {
+            if event.detail() != gtk::gdk::NotifyType::Inferior {
+                let _ = tauri::Emitter::emit_to(&emitter, crate::island::WINDOW_LABEL, "pointer-left", ());
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        let emitter = app.clone();
+        widget.connect_enter_notify_event(move |_, event| {
+            if event.detail() != gtk::gdk::NotifyType::Inferior {
+                let _ = tauri::Emitter::emit_to(&emitter, crate::island::WINDOW_LABEL, "pointer-entered", ());
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        if let Some(container) = widget.downcast_ref::<gtk::Container>() {
+            container.foreach(|child| watch(child, &app));
+        }
+    }
+    let Ok(gw) = win.gtk_window() else { return };
+    watch(gw.upcast_ref(), app);
+}
+
 pub fn make_non_activating(win: &WebviewWindow) {
     let Ok(gw) = win.gtk_window() else { return };
     // COUCOU_LAYER_SHELL=0 is the way out on a compositor where it misbehaves.
@@ -343,5 +457,12 @@ mod tests {
         ensure_private_dir(&dir).unwrap();
         assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_parent_comes_from_proc_stat() {
+        let ours = std::process::id();
+        assert_eq!(parent_pid(ours), Some(std::os::unix::process::parent_id()));
+        assert_eq!(parent_pid(u32::MAX), None);
     }
 }

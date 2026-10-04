@@ -8,7 +8,7 @@
 
 Approve permissions, watch your agents work, drop a file, chat with Claude — all without leaving what you're doing.
 
-[![Version](https://img.shields.io/github/v/release/Louis-CFM/coucou?filter=v*&label=version&color=0A84FF)](https://github.com/Louis-CFM/coucou/releases)
+[![Version](https://img.shields.io/github/v/release/myrikld/coucou?filter=v*&label=version&color=0A84FF)](https://github.com/myrikld/coucou/releases)
 ![macOS 15+](https://img.shields.io/badge/macOS-15%2B-black?logo=apple)
 ![Windows 10/11](https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-AppImage%20%7C%20deb%20%7C%20rpm-FCC624?logo=linux&logoColor=black)
@@ -16,7 +16,7 @@ Approve permissions, watch your agents work, drop a file, chat with Claude — a
 ![SwiftUI](https://img.shields.io/badge/SwiftUI-native-0A84FF)
 ![Tauri 2](https://img.shields.io/badge/Tauri-2-FFC131?logo=tauri&logoColor=black)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![GitHub stars](https://img.shields.io/github/stars/Louis-CFM/coucou?style=social)
+![GitHub stars](https://img.shields.io/github/stars/myrikld/coucou?style=social)
 
 <img src="docs/media/demo.gif" width="760" alt="Coucou in action">
 

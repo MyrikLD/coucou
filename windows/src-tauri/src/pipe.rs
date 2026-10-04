@@ -189,13 +189,30 @@ async fn handle(app: AppHandle, mut pipe: impl Relay) {
         return;
     }
 
+    // The status line fires on every reply: no log line, and no session either.
+    if payload.get("coucou_kind").and_then(Value::as_str) == Some("statusline") {
+        if let Some(limits) = payload.get("rate_limits") {
+            let _ = app.emit_to(WINDOW_LABEL, "plan", limits.clone());
+        }
+        pipe.finish();
+        return;
+    }
+
+    // The page gets the conversation's title, never the transcript's path.
+    if let Some(path) = payload.as_object_mut().and_then(|m| m.remove("transcript_path")) {
+        if let Some(title) = path.as_str().and_then(crate::titles::session_title) {
+            payload["session_title"] = json!(title);
+        }
+    }
+
     let event = payload
         .get("hook_event_name")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
 
-    if event != "PermissionRequest" {
+    let question = payload.get("coucou_kind").and_then(Value::as_str) == Some("ask_user_question");
+    if event != "PermissionRequest" && !question {
         log::line(format!("hook {event}"));
         let _ = app.emit_to(WINDOW_LABEL, "hook", payload);
         pipe.finish();
@@ -209,7 +226,7 @@ async fn handle(app: AppHandle, mut pipe: impl Relay) {
         pending.0.lock().unwrap().insert(id.clone(), tx);
     }
     payload["request_id"] = json!(id);
-    log::line(format!("hook PermissionRequest id={id}"));
+    log::line(format!("hook {} id={id}", if question { "AskUserQuestion" } else { "PermissionRequest" }));
     let _ = app.emit_to(WINDOW_LABEL, "hook", payload);
 
     let decision = wait_for_decision(&id, &mut rx).await;
@@ -283,6 +300,14 @@ pub fn acknowledge(app: &AppHandle, request_id: &str) {
 pub fn decline(app: &AppHandle, request_id: &str) {
     log::line(format!("decline id={request_id}"));
     send(app, request_id, Reply::Decline, false);
+}
+
+/// The island's answers to an AskUserQuestion, handed to coucou-hook --ask,
+/// which turns them into the tool's input.
+pub fn answer_question(app: &AppHandle, request_id: &str, answers: Value) {
+    log::line(format!("answers id={request_id}"));
+    let reply = json!({ "answers": answers }).to_string();
+    send(app, request_id, Reply::Decision(reply), false);
 }
 
 /// Called by the island's Allow / Deny buttons. Only ever a bare word: turning

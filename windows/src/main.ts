@@ -6,7 +6,9 @@ import { Sound } from "./core/sound";
 import { State, type Settings } from "./core/state";
 import { Island } from "./island/island";
 import { registerHookHandlers } from "./island/hooks";
+import { registerPlanHandlers } from "./island/plan";
 import { registerIntegrationHandlers, refreshConfigured } from "./island/integrations";
+import { refreshMusic, registerMusicHandlers } from "./island/music";
 
 async function main() {
   const root = document.getElementById("root");
@@ -19,6 +21,7 @@ async function main() {
   const boot = await Bridge.boot();
   if (boot) {
     State.settings = { ...State.settings, ...boot.settings };
+    State.mailClient = boot.mailClient;
   }
   island.applySettings();
   State.loadIntegrationTasks();
@@ -31,6 +34,7 @@ async function main() {
     if (State.paused === on) return;
     State.paused = on;
     void Bridge.setPaused(on);
+    void refreshMusic(island);
   };
 
   await onEvent<string>("tray", (what) => {
@@ -59,10 +63,13 @@ async function main() {
     island.applySettings();
     State.loadIntegrationTasks();
     void refreshConfigured();
+    void refreshMusic(island);
   });
 
   registerHookHandlers(island);
+  registerPlanHandlers();
   registerIntegrationHandlers(island);
+  void registerMusicHandlers(island);
 
   island.launch();
 

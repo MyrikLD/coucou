@@ -7,7 +7,8 @@
 // and any step that arrived mid-animation was dropped outright. Steps are now
 // queued instead, so a burst scrolls past rather than vanishing.
 
-import { h, svg } from "./dom";
+import { h, svg, clear } from "./dom";
+import { parseDiffStep } from "../core/diff";
 import { ICONS } from "./icons";
 import { cubicBezier, clamp, lerp } from "../core/anim";
 import type { AgentTask } from "../core/state";
@@ -26,7 +27,12 @@ interface Row {
   check: SVGElement;
   shimmer: HTMLElement;
   dim: HTMLElement;
+  wrap: HTMLElement;
+  /** "+N −M" after a file name, for diff steps. */
+  counts: HTMLElement;
   text: string;
+  /** The diff this row opens, when it is a diff step. */
+  diffId: number | null;
 }
 
 function makeRow(): Row {
@@ -38,22 +44,37 @@ function makeRow(): Row {
   const shimmer = h("span", { class: "tick-text shimmer" });
   const dim = h("span", {
     class: "tick-text",
-    style: "position:absolute;left:0;right:0;color:#6b7079",
+    style: "position:absolute;top:0;left:0;right:0;color:#6b7079",
   });
+  const wrap = h("span", { style: "position:relative;flex:1 1 auto;min-width:0" }, shimmer, dim);
+  const counts = h("span", { class: "tick-counts" });
   const el = h(
     "div",
     { class: "ticker-row" },
     h("span", { class: "tick-icon", style: "position:relative" }, chevron, check),
-    h("span", { style: "position:relative;flex:1 1 auto;min-width:0" }, shimmer, dim),
+    wrap,
+    counts,
   );
-  return { el, chevron, check, shimmer, dim, text: "" };
+  return { el, chevron, check, shimmer, dim, wrap, counts, text: "", diffId: null };
 }
 
 function setText(row: Row, text: string) {
   if (row.text === text) return;
   row.text = text;
-  row.shimmer.textContent = text;
-  row.dim.textContent = text;
+  const diff = parseDiffStep(text);
+  const label = diff ? diff.name : text;
+  row.shimmer.textContent = label;
+  row.dim.textContent = label;
+  row.diffId = diff ? diff.id : null;
+  row.el.classList.toggle("diff", diff != null);
+  // A file name keeps its counts right after it rather than at the far edge.
+  row.wrap.style.flex = diff ? "0 1 auto" : "1 1 auto";
+  row.wrap.style.overflow = diff ? "hidden" : "";
+  clear(row.counts);
+  if (diff) {
+    if (diff.added > 0) row.counts.append(h("span", { class: "add", text: ` +${diff.added}` }));
+    if (diff.removed > 0) row.counts.append(h("span", { class: "del", text: ` −${diff.removed}` }));
+  }
 }
 
 /**
@@ -79,8 +100,14 @@ export class Ticker {
   private startMs: number | null = null;
   private displayIndex = -1;
 
-  constructor() {
+  /** `onDiff` opens a diff step's card when its row is clicked. */
+  constructor(onDiff?: (id: number) => void) {
     this.el = h("div", { class: "ticker" }, this.a.el, this.b.el, this.c.el);
+    for (const row of [this.a, this.b, this.c]) {
+      row.el.addEventListener("click", () => {
+        if (row.diffId != null) onDiff?.(row.diffId);
+      });
+    }
     this.rest();
   }
 
@@ -93,6 +120,13 @@ export class Ticker {
 
   get animating(): boolean {
     return this.startMs != null || this.queue.length > 0;
+  }
+
+  /** Another task's steps are coming: the next sync drops straight into place. */
+  reset() {
+    this.queue = [];
+    this.startMs = null;
+    this.displayIndex = -1;
   }
 
   sync(task: AgentTask | null) {

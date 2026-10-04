@@ -33,6 +33,11 @@ pub const HOOK_EVENTS: &[(&str, u64)] = &[
     ("SubagentStop", 10),
 ];
 
+/// AskUserQuestion gets its own PreToolUse entry: the relay holds the tool
+/// until the island answers, so it needs longer than the other hooks.
+const ASK_MATCHER: &str = "AskUserQuestion";
+const ASK_TIMEOUT: u64 = 130;
+
 /// Marker that identifies a Coucou entry inside settings.json.
 const MARKER: &str = "coucou-hook";
 
@@ -40,6 +45,8 @@ const MARKER: &str = "coucou-hook";
 #[serde(rename_all = "camelCase")]
 pub struct HookStatus {
     pub installed: bool,
+    /// Installed by an older build, without the AskUserQuestion entry.
+    pub outdated: bool,
     pub settings_path: String,
     pub hook_path: String,
     pub hook_ready: bool,
@@ -117,6 +124,32 @@ fn hook_command(event: &str) -> String {
     format!("{} {event}", sh_quote(&settings::hook_exe_path().to_string_lossy()))
 }
 
+#[cfg(windows)]
+fn ask_command() -> String {
+    let exe = settings::hook_exe_path().to_string_lossy().replace('\\', "/");
+    format!("\"{exe}\" --ask")
+}
+
+#[cfg(unix)]
+fn ask_command() -> String {
+    format!("{} --ask", sh_quote(&settings::hook_exe_path().to_string_lossy()))
+}
+
+fn is_ask_entry(entry: &Value) -> bool {
+    entry_is_ours(entry) && entry.get("matcher").and_then(Value::as_str) == Some(ASK_MATCHER)
+}
+
+#[cfg(windows)]
+fn statusline_command() -> String {
+    let exe = settings::hook_exe_path().to_string_lossy().replace('\\', "/");
+    format!("\"{exe}\" --statusline")
+}
+
+#[cfg(unix)]
+fn statusline_command() -> String {
+    format!("{} --statusline", sh_quote(&settings::hook_exe_path().to_string_lossy()))
+}
+
 /// `s` as one single-quoted shell word: `'` becomes `'\''`, nothing else is
 /// special inside single quotes.
 #[cfg(unix)]
@@ -162,6 +195,16 @@ fn merged(existing: &Value) -> Value {
                 "timeout": timeout,
             }]
         }));
+        if *event == "PreToolUse" {
+            list.push(json!({
+                "matcher": ASK_MATCHER,
+                "hooks": [{
+                    "type": "command",
+                    "command": ask_command(),
+                    "timeout": ASK_TIMEOUT,
+                }]
+            }));
+        }
         hooks.insert((*event).to_string(), Value::Array(list));
     }
 
@@ -250,9 +293,15 @@ pub fn status() -> HookStatus {
                 .any(entry_is_ours)
         })
         .unwrap_or(false);
+    let has_ask = current
+        .pointer("/hooks/PreToolUse")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().any(is_ask_entry))
+        .unwrap_or(false);
     let hook_path = settings::hook_exe_path();
     HookStatus {
         installed,
+        outdated: installed && !has_ask,
         settings_path: settings_path().to_string_lossy().to_string(),
         hook_ready: hook_path.exists(),
         hook_path: hook_path.to_string_lossy().to_string(),
@@ -277,6 +326,12 @@ pub fn preview(install: bool) -> Result<HookPreview, String> {
 /// and make them look at a fresh diff, because the only thing worse than not
 /// installing the hooks is silently reverting somebody else's edit.
 pub fn write(install: bool, fingerprint: &str) -> Result<String, String> {
+    write_with(fingerprint, |current| if install { merged(current) } else { without_ours(current) })
+}
+
+/// The shared half of every write: refuse a file that moved since the preview,
+/// back it up, and swap the new contents in atomically.
+fn write_with(fingerprint: &str, transform: impl FnOnce(&Value) -> Value) -> Result<String, String> {
     let path = settings_path();
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -296,7 +351,7 @@ pub fn write(install: bool, fingerprint: &str) -> Result<String, String> {
         std::fs::copy(&path, &backup).map_err(|e| format!("backup failed: {e}"))?;
     }
 
-    let next = if install { merged(&current) } else { without_ours(&current) };
+    let next = transform(&current);
     let mut text = pretty(&next);
     text.push('\n');
 
@@ -427,6 +482,111 @@ fn install_relay(src: &Path, dest: &Path) {
         let _ = std::fs::remove_file(&temp);
         crate::log::line(format!("could not install {}: {err}", platform::HOOK_EXE));
     }
+}
+
+// ── Plan usage status line ────────────────────────────────────────────────────
+//
+// Claude Code hands its status line command the plan's rate limits, which is
+// the only place they appear. Coucou takes the `statusLine` slot with
+// `coucou-hook --statusline`; a status line the user already had is saved and
+// keeps running behind it, and comes back when the relay is removed.
+
+/// What happens to the saved previous status line once the write succeeds.
+#[derive(Debug, PartialEq)]
+enum Previous {
+    Keep,
+    Save(Value),
+    Delete,
+}
+
+fn previous_path() -> PathBuf {
+    settings::local_dir().join("statusline-previous.json")
+}
+
+fn statusline_is_ours(value: &Value) -> bool {
+    value
+        .get("command")
+        .and_then(Value::as_str)
+        .map(|c| c.contains(MARKER))
+        .unwrap_or(false)
+}
+
+pub fn statusline_installed() -> bool {
+    read_settings_lossy().get("statusLine").map(statusline_is_ours).unwrap_or(false)
+}
+
+/// Settings with the relay put in (or taken out), and what to do with the
+/// saved previous status line. `saved` is that file's contents, if any.
+fn with_statusline(existing: &Value, install: bool, command: &str, saved: Option<Value>) -> (Value, Previous) {
+    let mut root = existing.as_object().cloned().unwrap_or_default();
+    let current = root.get("statusLine").cloned();
+    let previous = if install {
+        let (next, previous) = match current {
+            Some(Value::Object(obj)) => {
+                let foreign = !statusline_is_ours(&Value::Object(obj.clone()));
+                let mut next = obj.clone();
+                next.insert("command".into(), json!(command));
+                let previous = if foreign { Previous::Save(Value::Object(obj)) } else { Previous::Keep };
+                (Value::Object(next), previous)
+            }
+            _ => (json!({ "type": "command", "command": command }), Previous::Keep),
+        };
+        root.insert("statusLine".into(), next);
+        previous
+    } else {
+        match current {
+            Some(ref sl) if statusline_is_ours(sl) => match saved {
+                Some(prev) => {
+                    root.insert("statusLine".into(), prev);
+                    Previous::Delete
+                }
+                None => {
+                    root.remove("statusLine");
+                    Previous::Keep
+                }
+            },
+            _ => Previous::Keep,
+        }
+    };
+    (Value::Object(root), previous)
+}
+
+fn saved_previous() -> Option<Value> {
+    let bytes = std::fs::read(previous_path()).ok()?;
+    serde_json::from_slice::<Value>(&bytes).ok().filter(Value::is_object)
+}
+
+pub fn statusline_preview(install: bool) -> Result<HookPreview, String> {
+    let current = read_settings()?;
+    let (next, _) = with_statusline(&current, install, &statusline_command(), saved_previous());
+    Ok(HookPreview {
+        diff: unified_diff(&pretty(&current), &pretty(&next)),
+        backup: backup_path().to_string_lossy().to_string(),
+        settings_path: settings_path().to_string_lossy().to_string(),
+        fingerprint: current_fingerprint(),
+    })
+}
+
+pub fn statusline_write(install: bool, fingerprint: &str) -> Result<String, String> {
+    let command = statusline_command();
+    let saved = saved_previous();
+    let mut previous = Previous::Keep;
+    let backup = write_with(fingerprint, |current| {
+        let (next, prev) = with_statusline(current, install, &command, saved);
+        previous = prev;
+        next
+    })?;
+    match previous {
+        Previous::Keep => {}
+        Previous::Save(value) => {
+            platform::ensure_private_dir(&settings::local_dir()).map_err(|e| e.to_string())?;
+            std::fs::write(previous_path(), pretty(&value)).map_err(|e| format!("saving the previous status line: {e}"))?;
+        }
+        Previous::Delete => {
+            let _ = std::fs::remove_file(previous_path());
+        }
+    }
+    Ok(backup)
 }
 
 // ── Minimal unified diff (LCS) ────────────────────────────────────────────────
@@ -567,11 +727,47 @@ mod tests {
             "another tool's hook was dropped"
         );
         assert!(pre.iter().any(entry_is_ours), "our own hook was not added");
+        assert_eq!(pre.iter().filter(|e| is_ask_entry(e)).count(), 1, "one AskUserQuestion entry");
+        assert_eq!(merged(&after)["hooks"]["PreToolUse"].as_array().unwrap().len(), pre.len(), "reinstall adds nothing twice");
         assert!(after["hooks"]["SomeEventWeDoNotTouch"].is_array());
 
         // And removing ours puts it back exactly as it was.
         let cleaned = without_ours(&after);
         assert_eq!(cleaned, existing);
+    }
+
+    #[test]
+    fn the_relay_takes_the_status_line_and_gives_it_back() {
+        let ours = "'/x/coucou-hook' --statusline";
+        let theirs = json!({ "type": "command", "command": "my-line.sh", "padding": 1 });
+        let existing = json!({ "model": "opus", "statusLine": theirs });
+
+        let (installed, prev) = with_statusline(&existing, true, ours, None);
+        assert_eq!(installed["statusLine"]["command"], ours);
+        assert_eq!(installed["statusLine"]["padding"], 1, "other fields stay");
+        assert_eq!(installed["model"], "opus");
+        assert_eq!(prev, Previous::Save(theirs.clone()));
+
+        // Reinstalling over ourselves must not save our own command as "previous".
+        let (_, again) = with_statusline(&installed, true, ours, Some(theirs.clone()));
+        assert_eq!(again, Previous::Keep);
+
+        let (removed, prev) = with_statusline(&installed, false, ours, Some(theirs.clone()));
+        assert_eq!(removed, existing);
+        assert_eq!(prev, Previous::Delete);
+    }
+
+    #[test]
+    fn removing_the_relay_never_touches_a_foreign_status_line() {
+        let existing = json!({ "statusLine": { "type": "command", "command": "mine.sh" } });
+        let (after, prev) = with_statusline(&existing, false, "x", None);
+        assert_eq!(after, existing);
+        assert_eq!(prev, Previous::Keep);
+
+        let empty = json!({});
+        let (installed, _) = with_statusline(&empty, true, "'/x/coucou-hook' --statusline", None);
+        let (removed, _) = with_statusline(&installed, false, "x", None);
+        assert_eq!(removed, empty);
     }
 
     #[test]

@@ -7,6 +7,10 @@
 import { Ease, lerp, type EaseFn } from "../core/anim";
 import { Sound } from "../core/sound";
 import type { BotEmoteName, BotStateName } from "../core/layout";
+import {
+  PUMPKIN_COLORS, drawOutfitBehind, drawOutfitFront, makeHead,
+  type OutfitId, type OutfitPlacement,
+} from "./outfits";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -36,7 +40,8 @@ interface Tween {
 
 type PropKey =
   | "yaw" | "pitch" | "roll" | "tilt" | "open" | "sx" | "sy"
-  | "oy" | "ox" | "tint" | "morph" | "hands" | "blush" | "es" | "badgeS";
+  | "oy" | "ox" | "tint" | "morph" | "hands" | "blush" | "es" | "badgeS"
+  | "outfitPresence";
 
 interface BotStateCfg {
   color: RGB;
@@ -173,6 +178,17 @@ export class BotEngine {
   yaw = 0; pitch = 0; roll = 0; tilt = 0; open = 1;
   sx = 1; sy = 1; oy = 0; ox = 0;
   tint = 0; morph = 0; hands = 0; blush = 0; es = 1; badgeS = 0;
+  rollTurns = 1;
+
+  /** What Mochi is wearing and how far it is on (0 hidden … 1 on). */
+  outfit: OutfitId = "none";
+  outfitPresence = 0;
+  private outfitTarget: OutfitId = "none";
+
+  // Spring lag of hat tips and pompoms (−1…1), driven by head motion.
+  physDx = 0; physDy = 0;
+  private physVx = 0; private physVy = 0;
+  private prevYaw = 0; private prevOy = 0; private prevRoll = 0;
 
   // Targets
   tgYaw = 0; tgPitch = 0; tgTilt = 0; tgSy = 1; tgSx = 1; tgEs = 1;
@@ -182,6 +198,10 @@ export class BotEngine {
 
   // Mouth spring (fraction of R)
   slotH = 0; slotHTarget = 0; slotHVel = 0; isChewing = false;
+
+  /** Dancing to the Now playing pill: level fades in over 0.3 s, out over 0.5 s. */
+  isDancing = false;
+  dancingLevel = 0;
 
   col: RGB = C.idle;
   colT: RGB = C.idle;
@@ -279,6 +299,7 @@ export class BotEngine {
   }
 
   squash() {
+    this.physVy += 0.6;
     this.anim("sy", [[0.78, 70, Ease.out], [1.1, 130, Ease.out], [1, 170, Ease.inOut]]);
     this.anim("sx", [[1.16, 70, Ease.out], [0.95, 130, Ease.out], [1, 170, Ease.inOut]]);
   }
@@ -304,6 +325,8 @@ export class BotEngine {
     this.slapTimes.push(t);
     Sound.play("slap");
     this.squash();
+    this.physVy -= 1.2;
+    this.physVx += Math.random() < 0.5 ? 0.7 : -0.7;
     if (this.slapTimes.length >= 3) {
       this.slapTimes = [];
       this.onDizzy?.();
@@ -316,7 +339,31 @@ export class BotEngine {
 
   doRoll(durationMs: number, turns: number) {
     this.roll = 0;
+    this.rollTurns = turns;
     this.anim("roll", [[Math.PI * 2 * turns, durationMs, Ease.inOut]], () => { this.roll = 0; });
+  }
+
+  /** Puts an outfit on (or takes it off): the old one leaves, then the new one drops in. */
+  setOutfit(next: OutfitId, animated = true) {
+    if (next === this.outfitTarget) return;
+    this.outfitTarget = next;
+    this.tweens.delete("outfitPresence");
+    this.locks.delete("outfitPresence");
+    const enter = () => {
+      this.outfit = next;
+      this.outfitPresence = 0;
+      this.anim("outfitPresence", [[1, 350, Ease.inOut]], () => this.squash());
+    };
+    if (!animated) {
+      this.outfit = next;
+      this.outfitPresence = next !== "none" ? 1 : 0;
+    } else if (next === "none") {
+      this.anim("outfitPresence", [[0, 180, Ease.inOut]], () => { this.outfit = "none"; });
+    } else if (this.outfit === "none") {
+      enter();
+    } else {
+      this.anim("outfitPresence", [[0, 180, Ease.inOut]], enter);
+    }
   }
 
   /** Peek wave — the "coucou". Timings from BotEngine.greet(). */
@@ -325,6 +372,7 @@ export class BotEngine {
     const tok = ++this.greetToken;
     this.waveStart = t + 0.45;
     this.waveUntil = t + 1.55;
+    this.physVx += 0.2;
 
     this.eyeOverride = "happy";
     this.eyeOverrideUntil = t + 2.0;
@@ -459,6 +507,7 @@ export class BotEngine {
       this.particles.length > 0 ||
       this.cfg.bounces || this.cfg.scans || this.cfg.breathes || this.cfg.zz || this.cfg.sweat ||
       this.isMini ||
+      this.isDancing || this.dancingLevel > 0.001 ||
       Math.abs(this.tgYaw - this.yaw) > 0.002 ||
       Math.abs(this.tgPitch - this.pitch) > 0.002 ||
       Math.abs(this.tgTilt - this.tilt) > 0.002 ||
@@ -466,10 +515,17 @@ export class BotEngine {
       Math.abs(this.tgSx - this.sx) > 0.002 ||
       Math.abs(this.tgEs - this.es) > 0.002 ||
       this.slotH > 0.001 || Math.abs(this.slotHVel) > 0.001 ||
+      (this.outfit !== "none" &&
+        (Math.abs(this.physVx) > 0.01 || Math.abs(this.physVy) > 0.01 ||
+          Math.abs(this.physDx) > 0.01 || Math.abs(this.physDy) > 0.01)) ||
       Math.abs(this.col[0] - this.colT[0]) > 0.003 ||
       Math.abs(this.col[1] - this.colT[1]) > 0.003 ||
       Math.abs(this.col[2] - this.colT[2]) > 0.003
     );
+  }
+
+  setDancing(dancing: boolean) {
+    this.isDancing = dancing;
   }
 
   // ── Tweens ──────────────────────────────────────────────────────────────────
@@ -558,6 +614,9 @@ export class BotEngine {
 
     if (this.isMini && n > this.miniNextBehavior) this.doMiniBehaviorLoop();
 
+    if (this.isDancing) this.dancingLevel = Math.min(1, this.dancingLevel + dt / 0.3);
+    else this.dancingLevel = Math.max(0, this.dancingLevel - dt / 0.5);
+
     const kLook = 1 - Math.pow(0.0025, dt);
     if (!this.locks.has("yaw")) this.yaw += (this.tgYaw - this.yaw) * kLook;
     if (!this.locks.has("pitch")) this.pitch += (this.tgPitch - this.pitch) * kLook;
@@ -596,6 +655,25 @@ export class BotEngine {
     const acc = omega * omega * (this.slotHTarget - this.slotH) - 2 * zeta * omega * this.slotHVel;
     this.slotHVel += acc * dt;
     this.slotH = Math.max(0, this.slotH + this.slotHVel * dt);
+
+    // Hat / pompom spring. A rigid roll with an outfit on flings the tips outward.
+    if (dt > 0) {
+      const yawVel = (this.yaw - this.prevYaw) / dt;
+      const oyVel = (this.oy - this.prevOy) / dt;
+      const rollVel = (this.roll - this.prevRoll) / dt;
+      const centrifugal = this.outfit !== "none" && this.outfitPresence > 0.05 ? rollVel * 0.18 : 0;
+      const tDx = Math.max(-1, Math.min(1, -yawVel * 0.35 - this.tilt * 2 + centrifugal));
+      const tDy = Math.max(-1, Math.min(1, oyVel * 0.5));
+      const stiff = 60;
+      const damp = 9;
+      this.physVx += (stiff * (tDx - this.physDx) - damp * this.physVx) * dt;
+      this.physVy += (stiff * (tDy - this.physDy) - damp * this.physVy) * dt;
+      this.physDx += this.physVx * dt;
+      this.physDy += this.physVy * dt;
+    }
+    this.prevYaw = this.yaw;
+    this.prevOy = this.oy;
+    this.prevRoll = this.roll;
 
     this.lastTime = n;
   }
@@ -647,7 +725,28 @@ export class BotEngine {
     const cx = W / 2 + this.ox * R;
     const cy = H / 2 + this.particleOverhang / 2 + this.oy * R + R * 0.06;
 
+    x.save();
+    this.applyDance(x, R, cx, cy);
+    const dressed = !this.isMini && this.outfit !== "none";
+    // With an outfit on, a roll turns the whole character, accessories included,
+    // instead of rolling the eyes over the surface.
+    const rigidRoll = dressed && this.outfitPresence > 0.05;
+    const outfitRoll = rigidRoll ? 0 : this.roll;
+    const head = makeHead(R, this.yaw, this.pitch, this.physDx, this.physDy, outfitRoll);
+    const placement: OutfitPlacement = {
+      cx, cy, tilt: this.tilt, sx: this.sx, sy: this.sy,
+      presence: this.outfitPresence, morph: this.morph, rollTurns: this.rollTurns,
+    };
+
+    x.save();
+    if (rigidRoll && Math.abs(this.roll) > 0.001) {
+      x.translate(cx, cy);
+      x.rotate(this.roll);
+      x.translate(-cx, -cy);
+    }
+
     this.drawHandsBehind(x, R, rx, ry, cx, cy);
+    if (dressed) drawOutfitBehind(x, this.outfit, head, placement);
 
     x.save();
     x.translate(cx, cy);
@@ -671,15 +770,34 @@ export class BotEngine {
       x.restore();
     }
 
-    this.drawEyes(x, body, R, rx, ry);
+    this.drawEyes(x, body, R, rx, ry, rigidRoll);
     if (this.morph > 0.05) this.drawMouth(x, body, R);
 
+    x.restore();
+
+    if (dressed) drawOutfitFront(x, this.outfit, head, placement);
     x.restore();
 
     if (this.badge && this.badgeS > 0.01 && this.morph < 0.25) {
       this.drawBadge(x, this.badge, R, cx, cy);
     }
     this.drawParticles(x, R, cx, cy);
+    x.restore();
+  }
+
+  /** BotEngine.applyDance — a 112 BPM hop and sway pivoting on the bottom of the body. */
+  private applyDance(x: CanvasRenderingContext2D, R: number, cx: number, cy: number) {
+    const l = this.dancingLevel;
+    if (l <= 0.001) return;
+    const px = cx;
+    const py = cy + R * 0.88;
+    const beat = (performance.now() / 1000) * 112 / 60;
+    const hop = Math.abs(Math.sin(Math.PI * beat));
+    const land = Math.pow(1 - hop, 6);
+    x.translate(px + 0.08 * R * Math.sin(Math.PI * beat) * l, py - 0.2 * R * hop * l);
+    x.rotate(0.1 * Math.sin(Math.PI * beat) * l);
+    x.scale(1 + 0.045 * land * l, 1 - 0.06 * land * l);
+    x.translate(-px, -py);
   }
 
   private bodyPath(rx: number, ry: number, R: number): Path2D {
@@ -711,15 +829,20 @@ export class BotEngine {
   }
 
   private drawBody(x: CanvasRenderingContext2D, body: Path2D, R: number, rx: number, ry: number) {
-    if (this.bodyColor) {
+    if (this.bodyColor && this.outfit !== "pumpkin") {
       // Mini bots: flat solid fill — no gradient, no reflection, no highlight
       x.fillStyle = rgba(this.bodyColor, 1);
       x.fill(body);
       return;
     }
     const g = x.createLinearGradient(rx * 0.7, -ry * 0.85, -rx * 0.8, ry * 0.9);
-    g.addColorStop(0, rgba(BASE_TOP));
-    g.addColorStop(1, rgba(BASE_BOTTOM));
+    if (this.outfit === "pumpkin") {
+      g.addColorStop(0, PUMPKIN_COLORS[0]);
+      g.addColorStop(1, PUMPKIN_COLORS[1]);
+    } else {
+      g.addColorStop(0, rgba(BASE_TOP));
+      g.addColorStop(1, rgba(BASE_BOTTOM));
+    }
     x.fillStyle = g;
     x.fill(body);
 
@@ -746,8 +869,14 @@ export class BotEngine {
     x.fill(body);
   }
 
-  private drawEyes(x: CanvasRenderingContext2D, body: Path2D, R: number, rx: number, ry: number) {
+  private drawEyes(
+    x: CanvasRenderingContext2D, body: Path2D, R: number, rx: number, ry: number, rigidRoll = false,
+  ) {
     let shape: EyeShape = this.eyeOverride ?? this.cfg.eye;
+    if (this.isDancing && this.dancingLevel > 0.15 && !this.isMini &&
+        (this.state === "idle" || this.state === "finished")) {
+      shape = "happy";
+    }
     if (this.morph > 0.5) {
       if (this.isChewing) shape = "happy";
       else if (this.slotHTarget > 0.05 || this.slotH > 0.1) shape = "cup";
@@ -761,7 +890,7 @@ export class BotEngine {
 
     for (const sd of [-1, 1]) {
       const eyeYaw = sd * EYE_SP + this.yaw;
-      let eyePitch = EYE_P + this.pitch + this.roll;
+      let eyePitch = EYE_P + this.pitch + (rigidRoll ? 0 : this.roll);
       eyePitch = (((eyePitch + Math.PI) % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
       const cp = Math.cos(eyePitch);
       if (Math.cos(eyeYaw) * cp <= 0.04) continue;

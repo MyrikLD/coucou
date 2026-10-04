@@ -8,6 +8,7 @@ import { h, svg, clear, dot } from "./dom";
 import { ICONS } from "./icons";
 import { State, type AgentTask } from "../core/state";
 import { Bridge } from "../core/bridge";
+import { githubDetail, githubSummary, type GitHubSection } from "./github";
 
 /** Same shape as the Swift `timeAgo` computed properties. */
 export function timeAgo(value: unknown): string {
@@ -54,6 +55,7 @@ const OPEN_URLS: Record<string, string> = {
 };
 
 function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
+  if (task.id === "integration_music") return musicIdleCard(task);
   const info = State.integrations[task.id];
   const configured = info?.configured ?? false;
   const error = info?.error ?? null;
@@ -69,7 +71,7 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
       h("button", {
         class: "link-btn",
         style: `color:${task.color}b3`,
-        text: "Open Visual Studio Code",
+        text: "Open terminal",
         onclick: () => void Bridge.openInVSCode(task.sessionCwd ?? null),
       }),
     );
@@ -110,7 +112,7 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
   return h(
     "div",
     { class: "int-card" },
-    header(task.color, task.id === "integration_claude" ? "VS Code" : task.name, "Integration"),
+    header(task.color, task.name, "Integration"),
     h("div", { class: "int-status" }, dot(statusColor, 5), h("span", { text: label })),
     actions,
   );
@@ -199,36 +201,6 @@ function resendCard(): HTMLElement {
   return h("div", { class: "int-card" }, header("#22C55E", "Resend", "Emails", extra), rows);
 }
 
-// ── GitHub ────────────────────────────────────────────────────────────────────
-
-function statRow(icon: string, color: string, label: string, value: string): HTMLElement {
-  return h(
-    "div",
-    { class: "int-stat" },
-    h("i", { class: "int-stat-icon", style: `color:${color}` }, svg(icon, 10)),
-    h("span", { class: "int-stat-label", text: label }),
-    h("span", { class: "int-stat-value", text: value }),
-  );
-}
-
-function githubCard(): HTMLElement {
-  const d = get("integration_github");
-  const stars = Number(d.totalStars ?? 0);
-  const repos = Number(d.totalRepos ?? 0);
-  const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
-  return h(
-    "div",
-    { class: "int-card" },
-    header("#F4505E", "GitHub", "Overview"),
-    h(
-      "div",
-      { class: "int-stats" },
-      statRow(ICONS.star, "#F5A524", "Total stars", fmt(stars)),
-      statRow(ICONS.stack, "#6B7079", "Repositories", String(repos)),
-    ),
-  );
-}
-
 // ── Stripe ────────────────────────────────────────────────────────────────────
 
 function stripeCard(): HTMLElement {
@@ -315,6 +287,56 @@ function calcomCard(): HTMLElement {
   return h("div", { class: "int-card" }, header("#C9956A", "Cal.com", "Schedule"), rows);
 }
 
+// ── Now playing ───────────────────────────────────────────────────────────────
+
+const MUSIC_ACCENT = "#FA2D48";
+
+function musicIdleCard(task: AgentTask): HTMLElement {
+  const d = get(task.id);
+  const actions = h("div", { class: "int-actions" });
+  if (d.canRaise) {
+    actions.append(
+      h("button", {
+        class: "link-btn",
+        style: `color:${task.color}d9`,
+        text: `Open ${String(d.identity || "player")}`,
+        onclick: () => void Bridge.musicControl("raise"),
+      }),
+    );
+  }
+  return h(
+    "div",
+    { class: "int-card" },
+    header(task.color, "Music", "Integration"),
+    h("div", { class: "int-status" }, dot("#22C55E", 5), h("span", { text: "Not playing" })),
+    actions,
+  );
+}
+
+function musicCard(): HTMLElement {
+  const d = get("integration_music");
+  const playing = d.playing === true;
+  const control = (icon: string, action: "previous" | "playPause" | "next", color: string, title: string) =>
+    h(
+      "button",
+      { class: "music-btn", style: `color:${color}`, title, onclick: () => void Bridge.musicControl(action) },
+      svg(icon, 11),
+    );
+  const head = h("div", { class: "int-head" }, dot(MUSIC_ACCENT, 7), h("b", { class: "music-title", text: String(d.title ?? "") }));
+  const card = h("div", { class: "int-card" }, head);
+  if (d.artist) card.append(h("div", { class: "music-artist", text: String(d.artist) }));
+  card.append(
+    h(
+      "div",
+      { class: "music-controls" },
+      control(ICONS.backward, "previous", "#8E939C", "Previous"),
+      control(playing ? ICONS.pause : ICONS.play, "playPause", MUSIC_ACCENT, playing ? "Pause" : "Play"),
+      control(ICONS.forward, "next", "#8E939C", "Next"),
+    ),
+  );
+  return card;
+}
+
 // ── n8n ───────────────────────────────────────────────────────────────────────
 
 function n8nCard(task: AgentTask, onDetail: () => void, openSettings: () => void): HTMLElement {
@@ -391,17 +413,22 @@ export function hasIntegrationData(id: string): boolean {
     case "integration_resend":
       return arr(id, "emails").length > 0;
     case "integration_github":
-      return get(id).totalRepos != null;
+      return get(id).totalRepos != null || get(id).pulse != null;
     case "integration_stripe":
       return info.loaded;
     case "integration_notion":
       return arr(id, "pages").length > 0;
     case "integration_calcom":
       return info.loaded;
+    case "integration_music":
+      return get(id).title != null;
     default:
       return false;
   }
 }
+
+/** Which GitHub list the open detail shows. */
+let githubSection: GitHubSection | null = null;
 
 export function renderIntegrationCard(task: AgentTask, hooks: IntegrationCardHooks): HTMLElement {
   if (task.id === "integration_n8n") {
@@ -409,6 +436,16 @@ export function renderIntegrationCard(task: AgentTask, hooks: IntegrationCardHoo
     return hooks.detailOpen && hasActivity
       ? n8nDetail(task, hooks.closeDetail)
       : n8nCard(task, hooks.openDetail, hooks.openSettings);
+  }
+  if (task.id === "integration_github" && hasIntegrationData(task.id)) {
+    return hooks.detailOpen && githubSection
+      ? githubDetail(githubSection, () => { githubSection = null; hooks.closeDetail(); })
+      : githubSummary((section) => {
+        githubSection = section;
+        // Opening a list refreshes it, as GithubPoller.refreshIfStale does.
+        void Bridge.refreshIntegration("integration_github");
+        hooks.openDetail();
+      });
   }
   if (task.id === "integration_vercel" && hasIntegrationData(task.id)) {
     return hooks.detailOpen ? vercelDetail(hooks.closeDetail) : vercelCard(hooks.openDetail);
@@ -418,14 +455,14 @@ export function renderIntegrationCard(task: AgentTask, hooks: IntegrationCardHoo
   switch (task.id) {
     case "integration_resend":
       return resendCard();
-    case "integration_github":
-      return githubCard();
     case "integration_stripe":
       return stripeCard();
     case "integration_notion":
       return notionCard();
     case "integration_calcom":
       return calcomCard();
+    case "integration_music":
+      return musicCard();
     default:
       return idleCard(task, hooks.openSettings);
   }

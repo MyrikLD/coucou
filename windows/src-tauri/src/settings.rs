@@ -20,10 +20,41 @@ pub struct Settings {
     /// Defaulted explicitly so a settings.json written by an older build still loads.
     #[serde(default = "default_model")]
     pub model: String,
+    /// "anthropic", "google", "openai", "ollama" or "lmstudio".
+    #[serde(default = "default_provider")]
+    pub chat_provider: String,
+    /// Per-provider model; empty means the provider's default.
+    #[serde(default)]
+    pub google_model: String,
+    #[serde(default)]
+    pub openai_model: String,
+    #[serde(default)]
+    pub ollama_model: String,
+    #[serde(default)]
+    pub lmstudio_model: String,
+    /// Local server base URLs; empty means not connected.
+    #[serde(default)]
+    pub ollama_url: String,
+    #[serde(default)]
+    pub lmstudio_url: String,
+    /// Claude plan usage pill in the island header.
+    #[serde(default)]
+    pub show_plan: bool,
+    /// Mochi's outfit: "auto" follows the seasons, otherwise an outfit id.
+    #[serde(default = "default_outfit")]
+    pub outfit: String,
 }
 
 fn default_model() -> String {
     crate::claude::DEFAULT_MODEL.to_string()
+}
+
+fn default_provider() -> String {
+    "anthropic".to_string()
+}
+
+fn default_outfit() -> String {
+    "auto".to_string()
 }
 
 impl Default for Settings {
@@ -43,6 +74,15 @@ impl Default for Settings {
             autostart: false,
             hooks_installed: false,
             model: default_model(),
+            chat_provider: default_provider(),
+            google_model: String::new(),
+            openai_model: String::new(),
+            ollama_model: String::new(),
+            lmstudio_model: String::new(),
+            ollama_url: String::new(),
+            lmstudio_url: String::new(),
+            show_plan: false,
+            outfit: default_outfit(),
         }
     }
 }

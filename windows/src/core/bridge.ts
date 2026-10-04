@@ -28,6 +28,10 @@ export interface BootInfo {
   hookPath: string;
   /** False where the OS has no global cursor (Wayland): see Island.followPageCursor. */
   cursorPoll: boolean;
+  /** Where API keys live, e.g. "the Secret Service". */
+  keyStore: string;
+  /** "Send by email" can open a draft in the desktop's mail client. */
+  mailClient: boolean;
 }
 
 export const Bridge = {
@@ -52,8 +56,14 @@ export const Bridge = {
 
   openUrl: (url: string) => call<void>("open_url", { url }),
 
-  /** "Open terminal" → opens the folder in VS Code when `code` is on PATH. */
+  /** "Open terminal" → the folder in VS Code when `code` is on PATH, else a terminal there. */
   openInVSCode: (path: string | null) => call<boolean>("open_in_vscode", { path }),
+
+  /** Focuses the terminal window a session runs in (Hyprland); false when it can't. */
+  focusSessionWindow: (pid: number) => call<boolean>("focus_session_window", { pid }),
+
+  /** A file Claude edited, in VS Code when `code` is on PATH, else its default app. */
+  openFile: (path: string) => call<boolean>("open_file", { path }),
 
   quit: () => call<void>("quit_app"),
 
@@ -73,6 +83,17 @@ export const Bridge = {
   hooksApply: (install: boolean, fingerprint: string) =>
     callOrThrow<string>("hooks_apply", { install, fingerprint }),
 
+  /** Whether the plan usage relay holds the status line slot. */
+  statuslineStatus: () => call<boolean>("statusline_status"),
+  statuslinePreview: (install: boolean) => callOrThrow<HookPreview>("statusline_preview", { install }),
+  /** Writes ~/.claude/settings.json — only after an explicit click, like the hooks. */
+  statuslineApply: (install: boolean, fingerprint: string) =>
+    callOrThrow<string>("statusline_apply", { install, fingerprint }),
+
+  /** The question card's answers; coucou-hook hands them to Claude Code. */
+  questionAnswer: (requestId: string, answers: Record<string, string | string[]>) =>
+    call<void>("question_answer", { requestId, answers }),
+
   approvalDecision: (requestId: string, decision: "allow" | "deny") =>
     call<void>("approval_decision", { requestId, decision }),
   /** "The card is up" — until this lands the relay only waits a moment. */
@@ -85,6 +106,14 @@ export const Bridge = {
   chatSend: (query: string, context: ChatContext | null) =>
     callOrThrow<{ text: string }>("chat_send", { query, context }),
   chatReset: () => call<void>("chat_reset"),
+  /** Models for the picker above the chat box; rejects with a sentence to show. */
+  chatModels: (provider: string) => callOrThrow<ChatModel[]>("chat_models", { provider }),
+  /** Settings → Connect: checks a local server before its URL is saved. */
+  chatProbeLocal: (provider: string, url: string) =>
+    callOrThrow<{ url: string; models: number }>("chat_probe_local", { provider, url }),
+  /** The mail card's Send button: Resend when configured, else a draft in the mail client. */
+  sendMail: (to: string, subject: string, body: string, attachment: string | null) =>
+    callOrThrow<"sent" | "drafted">("send_mail", { to, subject, body, attachment }),
   /** Copies a dropped file into the inbox. */
   ingestFile: (path: string) => callOrThrow<DroppedFile>("ingest_file", { path }),
   /** Only ever tells you whether a key exists — never its value. */
@@ -99,13 +128,39 @@ export const Bridge = {
 
   /** Tray → Pause. Stops the integration pollers, not just the island. */
   setPaused: (paused: boolean) => call<void>("set_paused", { paused }),
+
+  // ── Now playing ───────────────────────────────────────────────────────────
+  /** True where an MPRIS session bus exists (Linux). */
+  musicSupported: () => call<boolean>("music_supported"),
+  /** The track the pill shows right now; null when no player is open. */
+  musicState: () => call<MusicTrack | null>("music_state"),
+  musicControl: (action: "playPause" | "next" | "previous" | "raise") =>
+    call<void>("music_control", { action }),
 };
+
+export interface MusicTrack {
+  player: string;
+  identity: string;
+  title: string | null;
+  artist: string | null;
+  album: string | null;
+  artUrl: string | null;
+  playing: boolean;
+  positionMs: number | null;
+  lengthMs: number | null;
+  canRaise: boolean;
+}
 
 export interface IntegrationUpdate {
   id: string;
   data: Record<string, unknown>;
   error: string | null;
   event: { success: boolean; label: string; detail: string | null } | null;
+}
+
+export interface ChatModel {
+  id: string;
+  label: string;
 }
 
 export type ChatContext =
@@ -120,6 +175,8 @@ export interface DroppedFile {
 
 export interface HookStatus {
   installed: boolean;
+  /** Installed by an older build, without the AskUserQuestion entry. */
+  outdated: boolean;
   settingsPath: string;
   hookPath: string;
   hookReady: boolean;
